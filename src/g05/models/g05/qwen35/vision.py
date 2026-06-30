@@ -22,19 +22,37 @@ from .modules import rotate_half
 _flash_attn_varlen = None
 _flash_attn_backend = None
 
-try:
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen
 
-    _flash_attn_varlen = _fa4_varlen
-    _flash_attn_backend = "fa4"
-except ImportError:
+def _select_vision_flash_backend():
+    """Pick a flash-attention varlen kernel compatible with the current GPU.
+
+    FA4 (``flash_attn.cute``) only supports Hopper/Blackwell (compute capability
+    9.x+); its backward kernel asserts out on Ampere/Ada (e.g. A100, sm_80). So
+    FA4 is selected only on 9.0+ devices. Otherwise fall back to FA2 when it is
+    built, and finally to the SDPA path in ``_attend_spatial`` when neither is
+    usable (the correct path for A100, where FA2 is often not compiled).
+    """
     try:
-        from flash_attn import flash_attn_varlen_func as _fa2_varlen
+        major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 0
+    except Exception:
+        major = 0
 
-        _flash_attn_varlen = _fa2_varlen
-        _flash_attn_backend = "fa2"
+    if major >= 9:
+        try:
+            from flash_attn.cute import flash_attn_varlen_func as fa4
+
+            return fa4, "fa4"
+        except ImportError:
+            pass
+    try:
+        from flash_attn import flash_attn_varlen_func as fa2
+
+        return fa2, "fa2"
     except ImportError:
-        pass
+        return None, None
+
+
+_flash_attn_varlen, _flash_attn_backend = _select_vision_flash_backend()
 
 _VISION_FLASH_ATTN_WARNED = False
 

@@ -1,0 +1,1 @@
+/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/so101_square_finetune/runs/so100/so101_square_4ep_20260623_205729

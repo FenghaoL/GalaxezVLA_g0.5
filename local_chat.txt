@@ -1,0 +1,1235 @@
+你现在是在我的笔记本电脑本地上，连接着so101机械臂，然后我打算在服务器线上部署G0.5 VLA模型，服务器那边权重已经下载好了，现在准备进行服务器那边模型的运行，在本地用端口“ssh -N -L 8000:127.0.0.1:8000 fenghao@chickadee.engin.umich.edu”进行连接，然后在本地把本地so101以及fix camera和wrist camera按照格式的格式发送到服务器，控制机械臂。请你参考我发给你的之前部署pi0.5时候的记录，以及我在有g0.5的服务器上和那个codex的对话，为我提供完整的方案，详尽的告诉我每一步应该怎么做，并且解释清楚，让我能对这些步骤操作完全理解。我在本地“D:\workspace\Manipulation”这个下面有clone g0.5的repo“GalaxeaVLA”你可以参考一下，为我提供完整的方案，如果要写什么脚本或者.sh的话可以优先放在“scripts\g0.5”这里。我要做的是zero shot测试，所以应该就是在.sh里直接传prompt就行了？可以多给我一些备选，不用的那些prompt先注释起来，我自己判断要什么。
+
+
+
+Saturday 1:01 PM
+
+
+
+
+
+
+Worked for 12m 53s
+
+
+
+可以这样做，而且我已经按你本机的真实环境补好了关键兼容层。
+你的正确架构是：
+固定相机 + wrist 相机 + COM24 follower
+             │
+     Windows 笔记本上的 G0.5 client
+             │ WebSocket/msgpack，经 SSH 隧道
+     127.0.0.1:8765
+             │
+GPU 服务器上的 G0.5 policy server + g05-so101 权重
+             │
+       返回 6 维 action
+             │
+Windows client 转回 SO101 坐标并发到 COM24
+COM22 的 leader 不参与 G0.5 推理；也绝不能为了部署 G0.5 再运行 lerobot-setup-motors。
+先纠正端口与环境
+你写的 8000 不适用于当前 SO101 client 的默认配置。当前仓库的 SO101 server/client 默认都是 8765；8000 是仓库里另一套 DROID 部署的端口。
+推荐统一用 8765：
+ssh -N -L 127.0.0.1:8765:127.0.0.1:8765 fenghao@chickadee.engin.umich.edu
+服务端必须也监听 127.0.0.1:8765。这样 WebSocket 不会暴露到服务器公网或局域网。
+环境也不要混用：
+服务器：uv 创建的 .venv，负责 GPU 推理和权重。
+笔记本：继续用你现有 lerobot conda 环境，负责 COM24、相机和执行动作。
+不需要在笔记本下载 G0.5 权重，也不要在本机跑 uv sync 来部署模型。
+我确认过你现有环境是 LeRobot 0.3.4，已有 websockets、msgpack 等依赖，且保存着 calibration：
+C:\Users\19142\.cache\huggingface\lerobot\calibration\robots\so101_follower\fenghao_so101_follower.json
+我已经准备好的本地文件
+我修改了 [so100_policy_client.py (line 505)](D:\\workspace\\Manipulation\\GalaxeaVLA\\experiments\\so100\\so100_policy_client.py:505)：
+兼容你当前 LeRobot 的 SO101Follower API；
+新增 --task，可直接由脚本传入 prompt，不必每次在窗口里输入。
+并新增：
+[服务端启动脚本 (line 1)](D:\\workspace\\Manipulation\\GalaxeaVLA\\scripts\\g0.5\\start_g05_so101_server.sh:1)
+[SSH 隧道脚本 (line 1)](D:\\workspace\\Manipulation\\GalaxeaVLA\\scripts\\g0.5\\open_g05_policy_tunnel.ps1:1)
+[本机 SO101 client 启动脚本 (line 1)](D:\\workspace\\Manipulation\\GalaxeaVLA\\scripts\\g0.5\\run_g05_so101_client.ps1:1)
+脚本已通过 Python、Bash、PowerShell 语法检查；没有连接机械臂、相机或服务器。
+1. 在服务器确认环境与权重
+在服务器上：
+cd ~/workspace/GalaxeaVLA/GalaxeaVLA
+
+test -x .venv/bin/python
+test -f checkpoints/g05-so101/checkpoints/model_state_dict.pt
+test -f checkpoints/g05-so101/dataset_stats.json
+test -f checkpoints/g05-so101/.hydra/config.yaml
+test -f checkpoints/action_tokenizer.pt
+test -d checkpoints/qwen3_5_2b_base_processor
+
+./.venv/bin/python -c 'import torch, g05; print(torch.__version__); print(torch.cuda.get_device_name(0))'
+若 .venv 不存在，才执行：
+uv sync --locked --index-strategy unsafe-best-match
+不用 --extra dev；那是测试、Notebook、调试工具，不是部署必需。
+2. 在服务器启动 G0.5
+先用最保守的设置：GPU 0、关闭 torch.compile、每次只返回一个新动作。这会慢一点，但第一次真机最安全。
+cd ~/workspace/GalaxeaVLA/GalaxeaVLA
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+
+./.venv/bin/python scripts/serve_policy.py \
+  --ckpt_path "$PWD/checkpoints/g05-so101/checkpoints/model_state_dict.pt" \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --device cuda \
+  --action_steps 1 \
+  eval_embodiment=so100 \
+  model.model_weights_to_bf16=true \
+  model.use_torch_compile=false \
+  model.model_arch.attn_implementation=sdpa
+成功标志：
+Found run dir: ...
+Model and processor loaded on cuda.
+Policy server listening on ws://127.0.0.1:8765
+g05-so101 但 eval_embodiment=so100 并不矛盾：仓库把 SO100/SO101 共同使用的 6 自由度规范称为 so100。
+本地脚本里的服务端版本默认也采用 action_steps=1。确认方向、延迟和安全后，才可重启 server 并设为：
+G05_ACTION_STEPS=16 G05_TORCH_COMPILE=true \
+bash scripts/g0.5/start_g05_so101_server.sh \
+  checkpoints/g05-so101/checkpoints/model_state_dict.pt
+这里的 server 脚本目前在你笔记本 clone 中；若要在服务器使用，复制该文件到服务器同一仓库路径即可。
+3. 在笔记本建立 SSH 隧道
+开一个新的 PowerShell，保持不关：
+cd D:\workspace\Manipulation\GalaxeaVLA
+Set-ExecutionPolicy -Scope Process Bypass
+
+.\scripts\g0.5\open_g05_policy_tunnel.ps1
+另开 PowerShell 验证：
+Test-NetConnection 127.0.0.1 -Port 8765
+看到 TcpTestSucceeded : True 后，笔记本上的 client 就把服务器当作本机 127.0.0.1:8765。
+若你坚持使用端口 8000，也可以，但 server、SSH、client 三处都必须同时改为 8000；不要只改其中一处。
+4. 找到两个相机的 OpenCV 编号
+进入你已有环境：
+conda activate lerobot
+cd D:\workspace\Manipulation\so101\lerobot
+
+lerobot-find-cameras opencv
+用遮住镜头的方式确认：
+固定相机 → exterior
+腕部相机 → wrist_right
+这比 “fixed / wrist” 命名更重要，因为 G0.5 checkpoint 的图像槽位就是：
+exterior     = 固定相机
+wrist_right  = 腕部相机
+wrist_left   = 黑图补齐
+模型配置期望三路 3×480×640 RGB 图像。你实际两路没有问题；client 会自动将缺失的 wrist_left 填为黑图。当前代码里真正决定打开哪台摄像头的是 --camera-index，不是 --camera-map。
+5. 第一次必须 dry run
+清空桌面，机械臂放到安全姿态，确保有断电/急停方式。第一次运行：
+cd D:\workspace\Manipulation\GalaxeaVLA
+
+.\scripts\g0.5\run_g05_so101_client.ps1 `
+  -FixedCameraIndex 1 `
+  -WristCameraIndex 0 `
+  -Task "pick up the red block"
+把 1、0 换成你刚才确认的真实编号。
+它默认自动加入：
+--dry-run
+--no-home
+--max-step-deg 2
+含义：
+--dry-run：模型动作只记录，不会采用模型结果驱动机械臂；
+--no-home：禁止程序把机械臂移动到代码硬编码的训练初始姿态；
+--max-step-deg 2：未来真实执行时，每次目标变化最多 2°。
+注意：dry run 仍会打开 COM24、读取状态并维持当前目标，不是完全脱离硬件的纯模拟；但不会把模型预测动作写入 follower。
+你应检查：
+Dashboard 中固定相机和 wrist 相机画面正确、没有左右互换或旋转异常；
+日志出现 connected to ws://127.0.0.1:8765；
+server 不报 image/state schema error；
+本机日志中的 arm_state 是角度量级，不是全部 [-1,1]；
+有 [DryRun] would set_target [...]，但机械臂不跟随模型动作。
+如果出现 Running calibration...，先 Ctrl+C，不要在桌面任务开始前临时重做校准。正常情况下应使用你已存在的 fenghao_so101_follower calibration。
+6. 再进入真实执行
+仅当 dry run 全部通过后：
+.\scripts\g0.5\run_g05_so101_client.ps1 `
+  -FixedCameraIndex 1 `
+  -WristCameraIndex 0 `
+  -Task "pick up the red block" `
+  -EnableMotion
+仍保留 --no-home 和每步 2° 的限制。第一次只测试桌面中心、单一物体、短距离动作。发现方向不对、动作突兀、相机不对时，立刻 Ctrl+C 并断电；不要靠把 MaxStepDeg 调大来“修复”。
+prompt 怎么写
+是的，zero-shot 时任务文字就是 prompt，但这套 checkpoint 的配置是英文指令；先用短、具体、视觉可判别的英文。脚本中已经放了注释备用 prompt，也可以直接传：
+-Task "put the red block into the blue bowl"
+建议顺序：
+pick up the red block
+put the red block into the blue bowl
+move the wooden cube to the right
+pick up the yellow screwdriver
+不要一开始用“整理桌面”“把东西放好”这类含糊 prompt。zero-shot 代表无需你自己的 demonstration 就能测试，不代表它会自动适配任意物体、光照、相机安装角度和桌面布局。
+最后，数据在链路中实际长这样：
+本地发送：
+  images.exterior: RGB uint8, 3×480×640
+  images.wrist_right: RGB uint8, 3×480×640
+  images.wrist_left: 黑图占位
+  state.right_arm: 6 个关节角
+  task: 英文任务
+  embodiment_type: so100
+
+服务器返回：
+  action.right_arm: 6 个目标关节角
+
+本地执行：
+  模型坐标 → SO101 坐标 → 2°安全裁剪 → COM24
+其中 client 已按训练坐标系做了转换：
+\[
+q_\text{model}=
+[1,-1,1,1,1,1]\odot q_\text{arm}+
+[0,90,90,0,0,0]
+\]这也是为什么不能随意改关节正负号、offset 或混用另一个 robot ID。
+
+Edited 4 files+192-25Review changesUndoReview
+
+D:/workspace/Manipulation/GalaxeaVLA/experiments/so100/so100_policy_client.py+45-21
+D:/workspace/Manipulation/GalaxeaVLA/scripts/g0.5/open_g05_policy_tunnel.ps1+25-0
+D:/workspace/Manipulation/GalaxeaVLA/scripts/g0.5/run_g05_so101_client.ps1+70-3
+Show 1 more file
+
+
+
+Saturday 1:14 PM
+
+
+
+
+
+
+你的代码似乎有点放错地方了，我在本地主要的工作区域是这个so101的目录，之前说的放ps1文件的是这个地方。D:\workspace\Manipulation\so101\scripts\g0.5。还有那个client是不是也放到这边比较好，这个client需要依赖什么库吗？本地需要运行uv sync之类的吗？目前我有一个之前运行pi0.5的时候在本地用的conda env lerobot，这个合适吗，还是说里面lerobot库的版本可能和G0.5的不太匹配
+
+
+
+
+Saturday 1:41 PM
+
+
+
+
+
+
+Worked for 6m 29s
+
+
+
+已经改正：本机侧的入口现在都在 [scripts/g0.5](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5)。
+其中：
+[g05_so101_policy_client.py](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\g05_so101_policy_client.py) 是独立的本机 client。
+[run_g05_so101_client.ps1](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\run_g05_so101_client.ps1) 直接传 prompt 并启动它。
+[open_g05_policy_tunnel.ps1](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\open_g05_policy_tunnel.ps1) 建 SSH 隧道。
+[start_g05_so101_server.sh](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\start_g05_so101_server.sh) 是复制到服务器 G0.5 repo 后使用的 server 模板。
+[README.md](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\README.md) 写了本机运行顺序。
+client 放在 so101 是合理的：它是“机器人电脑侧”的程序，负责 COM24、相机和安全限幅；服务器的 GalaxeaVLA repo 只负责加载权重并推理。
+本机不需要运行 uv sync。你已有的 lerobot conda 环境适合，而且我实际核验过：
+Python      3.10.18
+LeRobot     0.3.4
+OpenCV      4.13.0
+NumPy       1.26.4
+websockets  16.0
+msgpack     已安装
+它的 CPU Torch 也无所谓，因为本机不加载 G0.5 模型。模型、CUDA、权重都只在服务器端，需要在服务器的 GalaxeaVLA/.venv 中用 uv sync。
+确实存在版本不匹配风险：上游 G0.5 的现成 SO100 client 假定较新的 LeRobot SOFollower API，而你本机是 SO101Follower。所以我没有让你硬装 lerobot==0.5.2，而是新 client 直接针对你现有的 LeRobot 0.3.4 API 编写；已完成导入、msgpack 编解码、Python 和 PowerShell 语法验证。
+你的相机默认沿用之前 Pi0.5 已使用的映射：
+固定相机 index 2 → G0.5 exterior
+腕部相机 index 0 → G0.5 wrist_right
+wrist_left         → 自动补黑图
+首次运行顺序：
+conda activate lerobot
+cd D:\workspace\Manipulation\so101\lerobot
+lerobot-find-cameras opencv
+确认编号后，开第一个 PowerShell：
+cd D:\workspace\Manipulation\so101
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\g0.5\open_g05_policy_tunnel.ps1
+开第二个 PowerShell，先 dry run：
+cd D:\workspace\Manipulation\so101
+
+.\scripts\g0.5\run_g05_so101_client.ps1 `
+  -Task "pick up the red block"
+它默认：
+连接 127.0.0.1:8765
+使用 COM24
+不执行模型动作（dry-run）
+不会自动 home
+每步最大目标变化 2°
+确认双相机画面、服务器响应和关节日志都正确后，才加：
+.\scripts\g0.5\run_g05_so101_client.ps1 `
+  -Task "pick up the red block" `
+  -EnableMotion
+之前在 GalaxeaVLA 里临时创建的本机脚本不再是运行入口；现在以 so101\scripts\g0.5 为准。
+
+README.mdDocument · MDOpen previewOpen in
+
+Edited 5 files+484-0Review changesUndoReview
+
+scripts/g0.5/README.md+42-0
+scripts/g0.5/g05_so101_policy_client.py+329-0
+scripts/g0.5/open_g05_policy_tunnel.ps1+22-0
+Show 2 more files
+
+
+
+Saturday 1:47 PM
+
+
+
+
+
+
+为我解释一下这个命令“cd ~/workspace/GalaxeaVLA/GalaxeaVLA
+
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+
+./.venv/bin/python scripts/serve_policy.py \
+  --ckpt_path "$PWD/checkpoints/g05-so101/checkpoints/model_state_dict.pt" \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --device cuda \
+  --action_steps 1 \
+  eval_embodiment=so100 \
+  model.model_weights_to_bf16=true \
+  model.use_torch_compile=false \
+  model.model_arch.attn_implementation=sdpa”还有你说的“关闭 torch.compile、每次只返回一个新动作。这会慢一点，但第一次真机最安全。”是什么意思，torch.compile是干嘛的？为我全解释清楚
+
+
+
+Sunday 2:46 AM
+
+
+
+
+
+
+Worked for 2m 4s
+
+
+
+这条命令的作用是：在服务器上启动一个“常驻的 G0.5 推理服务”，加载 g05-so101 权重，等待你笔记本通过 SSH 隧道发送相机图像、机械臂状态和文字任务，再返回关节动作。
+笔记本 client
+  固定相机 + wrist 相机 + COM24 状态 + prompt
+        │
+        │  WebSocket / msgpack，经 SSH 隧道
+        ▼
+服务器 G0.5 policy server
+  图像/状态预处理 → G0.5 推理 → 关节目标动作
+        │
+        ▼
+笔记本 client 限幅后写入 COM24
+下面逐行解释。
+cd ~/workspace/GalaxeaVLA/GalaxeaVLA
+切换到服务器上的 G0.5 仓库根目录。后面的 $PWD 就是这个目录的绝对路径。
+先确认这条路径确实存在：
+pwd
+ls
+如果你的 server repo 实际不在这个双层 GalaxeaVLA/GalaxeaVLA 路径，要以 pwd 的真实结果为准。
+export CUDA_VISIBLE_DEVICES=0
+指定这次启动的 Python 进程只“看见”服务器的第 0 张 GPU。
+例如服务器有 4 张 A100：
+物理 GPU: 0, 1, 2, 3
+本进程可见: 0
+这不是独占 GPU，也不是显存上限；别人仍可能使用 GPU 0。它只是让后续 PyTorch 的 cuda 指向这张卡。用 nvidia-smi 能检查它是否空闲、显存是否足够。
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+让 Python 能找到仓库的源码包 g05。
+这个仓库采用 src/ 布局：
+GalaxeaVLA/
+├── scripts/serve_policy.py
+└── src/g05/
+Python 默认不一定会去 src/ 下找包；这行把当前 repo 的 src 加到搜索路径最前面。
+其中：
+$PWD/src：当前仓库的源码目录。
+${PYTHONPATH:-}：保留原本的 PYTHONPATH；若它不存在则当作空字符串。
+双引号：保证路径中即使有特殊字符或空格也能正确传递。
+./.venv/bin/python scripts/serve_policy.py \
+直接使用这个 repo 的 .venv 中的 Python 运行服务端，而不是系统 Python、base conda 或本机的 lerobot。
+等价于先：
+source .venv/bin/activate
+python scripts/serve_policy.py ...
+但直接写 .venv/bin/python 更明确：不会不小心调用到错误的 Python 环境。
+--ckpt_path "$PWD/checkpoints/g05-so101/checkpoints/model_state_dict.pt"
+告诉服务端模型权重在哪。
+这里的 model_state_dict.pt 只是模型参数本体；服务端还会依据它向上寻找同一个 checkpoint bundle 中的文件：
+checkpoints/
+├── action_tokenizer.pt
+├── qwen3_5_2b_base_processor/
+└── g05-so101/
+    ├── .hydra/config.yaml
+    ├── dataset_stats.json
+    └── checkpoints/
+        └── model_state_dict.pt
+它们分别负责：
+.hydra/config.yaml：模型结构、预处理器、动作编码器等配置；
+dataset_stats.json：状态与动作的归一化/反归一化统计；
+action_tokenizer.pt：动作 token 编码器；
+qwen3_5_2b_base_processor/：视觉语言处理器。
+因此不能只拷贝 .pt 文件。
+--host 127.0.0.1
+服务端只监听服务器自身的回环地址。
+也就是说，服务器上的 WebSocket 只能被“服务器自己”连接，外部机器无法直接连接：
+可连接：服务器本机 → 127.0.0.1:8765
+不可直接连接：局域网电脑 → 服务器IP:8765
+这正好配合 SSH 隧道：
+ssh -N -L 127.0.0.1:8765:127.0.0.1:8765 fenghao@chickadee.engin.umich.edu
+本机 client 连接：
+ws://127.0.0.1:8765
+SSH 会把流量安全地转到服务器的：
+127.0.0.1:8765
+相比 --host 0.0.0.0，这样不会把一个没有认证、可直接控制机械臂的推理接口暴露给网络。
+--port 8765
+WebSocket 服务端口。它必须和三处一致：
+服务器 --port 8765
+SSH -L 本地8765:服务器8765
+本机 client --port 8765
+--device cuda
+让模型在 CUDA GPU 上推理。
+由于前面已设置：
+CUDA_VISIBLE_DEVICES=0
+这里的 cuda 对当前进程来说就是那张可见的 GPU 0。
+--action_steps 1
+这是第一次真机测试最关键的参数之一。
+G0.5 一次模型推理通常可以预测一串未来动作，例如：
+第 1 步、第 2 步、第 3 步……第 32 步
+服务端会缓存这串动作，按控制周期一条一条发给 client。
+--action_steps 决定“做几步后重新拍相机、读关节、跑一次模型”。
+设置	行为
+1	每执行一个动作，都重新发送最新图像和关节状态，再推理一次
+4	一次推理后连续使用 4 步缓存动作
+16	连续使用 16 步缓存动作
+32	连续使用 32 步缓存动作
+
+当 action_steps=1 时：
+相机/状态 → 模型 → 第 1 个动作
+相机/状态 → 模型 → 第 1 个动作
+相机/状态 → 模型 → 第 1 个动作
+...
+每一步都基于最新观察，因此对首次真机更安全：机械臂没按预期移动、物体滑走、相机稍有抖动时，下一步会立即重新观察，而不是继续执行十几步旧计划。
+代价是慢。模型每一步都要跑一次，所以实际控制频率取决于：
+\[
+f_{\text{actual}} \leq \min(f_{\text{client}}, f_{\text{model inference}})
+\]即使你 client 设置为 15 Hz，若单次推理需 150 ms，实际也到不了 15 Hz。
+它的安全含义也要准确理解：
+action_steps=1 减少“陈旧观察导致的连续错误动作”；
+它不会限制某一个模型动作本身的大小；
+真正的机械安全仍来自本机的 --dry-run、--no-home、--max-step-deg 2、清空桌面和人工监控。
+确认动作方向、相机位置和延迟都正确后，再考虑改为 4、8 或 16。
+eval_embodiment=so100
+这不是普通命令行参数，而是 Hydra 配置覆盖项。
+g05-so101 是专门给 SO-100/SO-101 机械臂的权重，但 G0.5 内部把这一类 6 关节机械臂的 canonical embodiment 名称叫作 so100。它会让服务端只保留 SO100/SO101 对应的：
+图像槽位定义；
+6 维 right_arm 状态与动作；
+预处理器；
+归一化统计。
+所以这里必须是：
+eval_embodiment=so100
+不是 so101。
+model.model_weights_to_bf16=true
+将大部分模型权重放入 bfloat16，即 BF16 精度。
+FP32 每个浮点数通常 4 bytes；BF16 通常 2 bytes，因此能显著降低模型显存占用和显存带宽压力。A100 对 BF16 有硬件支持，推理通常更合适。
+它不意味着所有数值都强制 BF16。代码会在转换后调用：
+model.apply_fp32_params()
+把需要更高数值稳定性的特定参数保留/恢复为 FP32。
+这不是安全开关，主要是推理的显存和速度设置。
+model.use_torch_compile=false
+这是你问的核心。
+PyTorch 正常执行模型时，属于 eager mode：Python 按层、按算子一步步调用 GPU。
+Python
+  → attention
+  → MLP
+  → normalization
+  → residual add
+  → 下一个模块
+torch.compile 是 PyTorch 2 提供的图编译/优化功能。启用后，PyTorch 会尝试：
+捕获模型实际执行的计算图；
+分析张量形状、dtype、算子连接；
+融合一部分连续 GPU 操作；
+生成更高效的执行代码或 kernel 调度；
+后续同形状输入复用已编译结果。
+理想情况下，它能减少 Python 调度开销、减少中间张量读写，并提高稳定运行后的吞吐或降低延迟。
+但它有三个现实成本：
+第一次推理很慢
+动态形状或分支可能触发重新编译
+报错栈更长、更难判断是模型、编译器还是 CUDA 问题
+注意：在这个仓库中，torch.compile(...) 的包装发生在 server 启动时，但真正的大量编译通常在第一条真实推理请求到来时触发。因此你可能看到：
+Server 已经 listening
+本机发送第一帧
+等待明显比后续长
+这就是所谓的“首帧编译延迟”。
+关闭它：
+model.use_torch_compile=false
+意味着：
+不走图编译
+直接用 PyTorch eager mode 推理
+稳定运行后的平均速度可能较低，但行为更直接、首次请求更可预期、出错时日志更容易定位。
+所以我说“第一次真机更安全”，准确说是工程调试层面的安全：
+不会把第一次失败混淆成 compile/CUDA/模型/网络中的哪一层；
+不会因为首帧编译等待很久，让你误以为 client 死掉；
+能先验证相机、状态坐标、动作方向和 SSH 链路；
+成功后再开 compile，性能问题与机器人接口问题就能分开判断。
+它不会让模型“更保守”，也不会代替本机的机械臂安全限幅。
+当 dry run 和低速真机测试都稳定后，可以重启 server 改为：
+model.use_torch_compile=true
+此时最好先进行一次 dry run warm-up，让编译发生在不执行动作的阶段。
+model.model_arch.attn_implementation=sdpa
+指定 Transformer attention 使用 PyTorch 的 SDPA：
+\[
+\text{Attention}(Q,K,V)
+=
+\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d}}\right)V
+\]SDPA 即 Scaled Dot-Product Attention。PyTorch 会根据 A100、张量 shape 和 dtype，尽量选择合适的高效 CUDA attention 实现。
+用 sdpa 的好处是：
+不依赖额外 attention 实现的特殊运行条件；
+比较稳，适合第一轮部署；
+通常性能也不错。
+它同样不是机械安全选项，而是模型内部 attention 的实现选择。
+这条命令完整执行后的生命周期
+1. shell 切到 G0.5 repo
+2. 限制本进程只使用 GPU 0
+3. 让 Python 找到 src/g05
+4. 用 server 的 .venv Python 启动服务
+5. 由 checkpoint 路径找到 .hydra/config.yaml 与 dataset_stats.json
+6. 加载模型、action tokenizer、processor、归一化统计
+7. 过滤到 so100/SO101 embodiment
+8. 转为 BF16 权重
+9. 不启用 torch.compile，保持 eager 推理
+10. 在服务器 127.0.0.1:8765 启动 WebSocket 服务
+11. 等待 SSH 隧道后的本机 client 连接
+12. action_steps=1：每次 client 请求都重新推理最新观测
+启动成功时，重点看：
+Found run dir: ...
+Model and processor loaded on cuda.
+Policy server listening on ws://127.0.0.1:8765 (mode=RTC, device=cuda)
+其中 mode=RTC 就是 action_steps=1 的实时重算模式。
+
+Sunday 2:48 AM
+
+
+
+
+
+
+遇到了报错，分析一下原因“(lerobot) PS D:\workspace\Manipulation\so101> .\scripts\g0.5\run_g05_so101_client.ps1 
+>>   -Task "pick up the white block"
+警告: DRY RUN: no G0.5 action will be sent to COM24. Add -EnableMotion only after a successful dry 
+run.
+G0.5 SO101 client
+  task:    pick up the white block
+  policy:  ws://127.0.0.1:8765
+  cameras: exterior=2, wrist_right=0
+2026-06-21 02:59:11,696 INFO lerobot.cameras.opencv.camera_opencv: OpenCVCamera(2) connected.
+2026-06-21 02:59:14,246 INFO lerobot.cameras.opencv.camera_opencv: OpenCVCamera(0) connected.
+2026-06-21 02:59:14,294 INFO lerobot.robots.so101_follower.so101_follower: fenghao_so101_follower SO101Follower connected.
+Connected to follower at COM24; policy endpoint: ws://127.0.0.1:8765
+Task: 'pick up the white block'
+Press Ctrl+C to stop. Press Escape in a camera window to stop when display is enabled.
+DRY RUN: model targets will be printed but never sent to COM24.
+G0.5 server handshake: {'action_steps': 1}
+2026-06-21 02:59:45,418 INFO lerobot.cameras.opencv.camera_opencv: OpenCVCamera(2) disconnected.
+2026-06-21 02:59:45,861 INFO lerobot.cameras.opencv.camera_opencv: OpenCVCamera(0) disconnected.
+2026-06-21 02:59:45,862 INFO lerobot.robots.so101_follower.so101_follower: fenghao_so101_follower SO101Follower disconnected.
+Traceback (most recent call last):
+  File "C:\Users\19142\.conda\envs\lerobot\lib\site-packages\websockets\asyncio\connection.py", line 305, in recv
+    return await self.recv_messages.get(decode)
+  File "C:\Users\19142\.conda\envs\lerobot\lib\site-packages\websockets\asyncio\messages.py", line 158, in get
+    frame = await self.frames.get(not self.closed)
+  File "C:\Users\19142\.conda\envs\lerobot\lib\site-packages\websockets\asyncio\messages.py", line 51, in get
+    await self.get_waiter
+asyncio.exceptions.CancelledError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\19142\.conda\envs\lerobot\lib\asyncio\tasks.py", line 456, in wait_for
+    return fut.result()
+asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\workspace\Manipulation\so101\scripts\g0.5\g05_so101_policy_client.py", line 221, in run
+    response = unpackb(await asyncio.wait_for(websocket.recv(), timeout=args.timeout_s))
+  File "C:\Users\19142\.conda\envs\lerobot\lib\asyncio\tasks.py", line 458, in wait_for
+    raise exceptions.TimeoutError() from exc
+asyncio.exceptions.TimeoutError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\workspace\Manipulation\so101\scripts\g0.5\g05_so101_policy_client.py", line 329, in <module>
+    raise SystemExit(main())
+  File "D:\workspace\Manipulation\so101\scripts\g0.5\g05_so101_policy_client.py", line 322, in main
+    asyncio.run(run(args))
+  File "C:\Users\19142\.conda\envs\lerobot\lib\asyncio\runners.py", line 44, in run
+    return loop.run_until_complete(main)
+  File "C:\Users\19142\.conda\envs\lerobot\lib\asyncio\base_events.py", line 649, in run_until_complete
+    return future.result()
+  File "D:\workspace\Manipulation\so101\scripts\g0.5\g05_so101_policy_client.py", line 288, in run
+    cv2.destroyAllWindows()
+cv2.error: OpenCV(4.13.0) D:\a\opencv-python\opencv-python\opencv\modules\highgui\src\window.cpp:1295: error: (-2:Unspecified error) The function is not implemented. Rebuild the library with Windows,GTK+ 2.x or Cocoa support. If you are on Ubuntu or Debian, install libgtk2.0-dev and pkg-config, then re-run cmake or configure script in function 'cvDestroyAllWindows'” 服务器上是这样“(g05) fenghao@chickadee:~/workspace/GalaxeaVLA/GalaxeaVLA$ ./.venv/bin/python scripts/serve_policy.py   --ckpt_path "$PWD/checkpoints/g05-so101/checkpoints/model_state_dict.pt"   --host 127.0.0.1   --port 8765   --device cuda   --action_steps 1   eval_embodiment=so100   model.model_weights_to_bf16=true   model.use_torch_compile=false   model.model_arch.attn_implementation=sdpa
+/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Found run dir: /home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101
+
+   ______   ____    ______
+  / ____/  / __ \  / ____/
+ / / __   / / / / /___ \
+/ /_/ /  / /_/ / ____/ /
+\____/   \____(_)_____/
+─────────────────────────────────────────────────
+Galaxea Foundation Model · v0.0.1 · Policy Server
+─────────────────────────────────────────────────
+
+06/20 [14:45:07] INFO     | >> [FMHelper] Multi-sample  fm_helper.py:59
+                          flow matching enabled:                       
+                          num_flow_samples=8 (AE batch                 
+                          = 8×B)                                       
+06/20 [14:45:12] WARNING  | >> Current Python version 3.10  utils.py:77
+                          is below the recommended 3.11                
+                          version. It is recommended to                
+                          upgrade to Python 3.11 or higher             
+                          for the best experience.                     
+/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+06/20 [14:45:30] INFO     | >> [G05Model]               g05_model.py:85
+                          proprio_embedder enabled:                    
+                          proprio_dim=20 → d_vlm=2048                  
+06/20 [14:45:31] INFO     | >>                           wrapper.py:198
+                          ╔═════════════════════════════               
+                          ═════════════════════════════╗               
+                          ║              ActionCodecV2                 
+                          —  Init Summary              ║               
+                          ╠═════════════════════════════               
+                          ═════════════════════════════╣               
+                          ║  horizon       32  patch=8                 
+                          D≤9  DCT=on(bs=8)            ║               
+                          ║  channels      256 → 256 →                 
+                          512 → 512 → 128                              
+                          ║                                            
+                          ║  strides       [[1, 1], [2,                
+                          1], [2, 1]]                  ║               
+                          ║  depths        [2, 2, 2]                   
+                          heads=8×64d  FFN×4                           
+                          ║                                            
+                          ║  RVQ           4×4096×8d                   
+                          (131.1K)  drop=0.5  ema=0.95                 
+                          ║                                            
+                          ║  tokens/key    32  (code_h=1               
+                          × code_a=8 × 4cb)           ║                
+                          ╠═════════════════════════════               
+                          ═════════════════════════════╣               
+                          ║  conv_in/out   8.5K                        
+                          ║                                            
+                          ║  encoder       21.06M                      
+                          ║                                            
+                          ║  decoder       21.06M                      
+                          ║                                            
+                          ║  rvq           8.2K                        
+                          ║                                            
+                          ║  TOTAL         42.13M                      
+                          ║                                            
+                          ╠═════════════════════════════               
+                          ═════════════════════════════╣               
+                          ║  rule-based                                
+                          ConstrainedSequenceTokenizer(s               
+                          eq_len=32, min_block_len=1,                  
+                          vocab_size=4096,                             
+                          num_valid=7,049,156,                         
+                          num_tokens=2)║                               
+                          ║  │              └─                         
+                          Compression: 32-len binary seq               
+                          with min_block_len=1 has                     
+                          7,049,156 possibilities,                     
+                          vocab_size=4,096 → needs 2                   
+                          tokens║                                      
+                          ╚═════════════════════════════               
+                          ═════════════════════════════╝               
+                 WARNING  | >> ActionCodecV2Wrapper:     wrapper.py:731
+                          checkpoint                                   
+                          'checkpoints/action_tokenizer.               
+                          pt' has no tokenizer_meta.                   
+                          Falling back to YAML key_dims.               
+                          Re-save with train_vq.py to                  
+                          embed it.                                    
+                 INFO     | >> ActionCodecV2Wrapper:     wrapper.py:741
+                          loaded weights from                          
+                          checkpoints/action_tokenizer.p               
+                          t                                            
+                 INFO     | >> action_token_begin_idx:   vq_base.py:276
+                          248077, action_token_end_idx:                
+                          252183, group_markers(10):                   
+                          ['<left_control_0>',                         
+                          '<right_control_0>',                         
+                          '<left_control_1>',                          
+                          '<right_control_1>',                         
+                          '<left_control_2>',                          
+                          '<right_control_2>',                         
+                          '<left_control_3>',                          
+                          '<right_control_3>',                         
+                          '<left_gripper>',                            
+                          '<right_gripper>'] (action_idx               
+                          range [4096, 4106)                           
+                 INFO     | >> [TokenRegistry]     token_registry.py:43
+                          Registered 4106 new                          
+                          tokens: ['<action0000>',                     
+                          '<action0001>',                              
+                          '<action0002>',                              
+                          '<action0003>',                              
+                          '<action0004>']...                           
+                 INFO     | >> [TokenRegistry]     token_registry.py:43
+                          Registered 1 new tokens:                     
+                          ['<EOV>']                                    
+                 INFO     | >> [TokenRegistry]     token_registry.py:43
+                          Registered 1 new tokens:                     
+                          ['<state>']                                  
+06/20 [14:45:39] INFO     | >> [G05ModelQwen35] g05_model_qwen35.py:138
+                          Resized embedding:                           
+                          248320 → 252185                              
+                          (+4108 tokens: 4096                          
+                          action tokens                                
+                          (<action0000>~<action                        
+                          4095>),                                      
+                          <left_control_0>,                            
+                          <right_control_0>,                           
+                          <left_control_1>,                            
+                          <right_control_1>,                           
+                          <left_control_2>,                            
+                          <right_control_2>,                           
+                          <left_control_3>,                            
+                          <right_control_3>,                           
+                          <left_gripper>,                              
+                          <right_gripper>,                             
+                          <EOV>, <state>)                              
+                 INFO     | >> [TokenRegistry]     token_registry.py:77
+                          Resized model embedding:                     
+                          248320 → 252185                              
+                 INFO     | >>                input_preprocessor.py:696
+                          [InputPreprocessor]                          
+                          Built-in modality                            
+                          processors                                   
+                          registered:                                  
+                          ['image',                                    
+                          'proprio',                                   
+                          'action', 'text',                            
+                          'affordance']                                
+                 INFO     | >>                input_preprocessor.py:295
+                          [InputPreprocessor]                          
+                          Initialized with                             
+                          modality                                     
+                          processors:                                  
+                          ['image',                                    
+                          'proprio',                                   
+                          'action', 'text',                            
+                          'affordance']                                
+                 INFO     | >> [G05PolicyQwen35]      g05_policy.py:358
+                          state token synced:                          
+                          state_token_id=252184                        
+                 INFO     | >> [ARHelper]              ar_helper.py:131
+                          token_index_ranges                           
+                          configured: action=[248077,                  
+                          252183]                                      
+                 WARNING  | >> BAR config mismatch:   g05_policy.py:334
+                          model_cfg=True                               
+                          tokenizer=False                              
+                          bos_blk_id=None → forcing                    
+                          runtime_bar=False                            
+                 INFO     | >> BAR runtime state:     g05_policy.py:342
+                          tokenizer=False                              
+                          model_cfg=False (after                       
+                          sync) bos_blk_id=None                        
+                          eos_blk_id=None                              
+                          block_size=None                              
+                 INFO     | >> [G05Policy] EOV token  g05_policy.py:248
+                          synced: eov_token_id=252183                  
+                 INFO     | >>                           log_box.py:129
+                          ╔═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╗                                         
+                          ║                     🤖  G05                
+                          Policy Config                                
+                          ║                                            
+                          ╠═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╣                                         
+                          ║  AR Path               ✅                  
+                          enabled                                      
+                          (discrete_action=True)     ║                 
+                          ║  FM Path               ✅                  
+                          enabled                                      
+                          (continuous_action=True)   ║                 
+                          ║  predict_cot           True                
+                          ║                                            
+                          ║  return_continuous     True                
+                          ║                                            
+                          ╚═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╝                                         
+                 INFO     | >>                           log_box.py:129
+                          ╔═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╗                                         
+                          ║                      📐                    
+                          Sequence Config                              
+                          ║                                            
+                          ╠═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╣                                         
+                          ║  obs_steps             1                   
+                          ║                                            
+                          ║  action_steps          32                  
+                          ║                                            
+                          ║  cameras               3                   
+                          ║                                            
+                          ║  input_images          3                   
+                          ║                                            
+                          ╚═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╝                                         
+06/20 [14:45:41] INFO     | >>                           log_box.py:129
+                          ╔═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╗                                         
+                          ║               📊  VLA                      
+                          Checkpoint — Load Summary                    
+                          ║                                            
+                          ╠═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╣                                         
+                          ║  Loaded                946 /               
+                          946  ✅                                      
+                          ║                                            
+                          ║  Partial (handled)     0                   
+                          ║                                            
+                          ║  Missing (rand init)   0                   
+                          ║                                            
+                          ║  Unexpected (skip)     0                   
+                          ║                                            
+                          ╚═════════════════════════════               
+                          ══════════════════════════════               
+                          ═══╝                                         
+06/20 [14:45:44] WARNING  | >>  Image 'exterior'  base_processor.py:462
+                          shape [3, 224, 224] is                       
+                          overridden by                                
+                          camera_size_config=[256                      
+                          , 256] -> [3, 256,                           
+                          256]. The shape field                        
+                          in the embodiment yaml                       
+                          is stale; consider                           
+                          removing it.                                 
+                 WARNING  | >>  Image             base_processor.py:462
+                          'wrist_left' shape [3,                       
+                          224, 224] is overridden                      
+                          by                                           
+                          camera_size_config=[256                      
+                          , 256] -> [3, 256,                           
+                          256]. The shape field                        
+                          in the embodiment yaml                       
+                          is stale; consider                           
+                          removing it.                                 
+                 WARNING  | >>  Image             base_processor.py:462
+                          'wrist_right' shape [3,                      
+                          224, 224] is overridden                      
+                          by                                           
+                          camera_size_config=[256                      
+                          , 256] -> [3, 256,                           
+                          256]. The shape field                        
+                          in the embodiment yaml                       
+                          is stale; consider                           
+                          removing it.                                 
+                 INFO     | >> Model and processor  serve_policy.py:514
+                          loaded on cuda.                              
+                 INFO     | >> server listening on        server.py:341
+                          127.0.0.1:8765                               
+                 INFO     | >> Policy server        serve_policy.py:460
+                          listening on                                 
+                          ws://127.0.0.1:8765                          
+                          (mode=RTC, device=cuda)                      
+06/20 [14:59:13] INFO     | >> connection open            server.py:531
+                 INFO     | >> Client connected:    serve_policy.py:410
+                          ('127.0.0.1', 37394)                         
+                          (action_steps=1)                             
+06/20 [14:59:56] INFO     | >> [CoT]                  g05_policy.py:837
+                          ['<right_control_0><action2                  
+                          144><action3311><action2144                  
+                          ><action3459><action2144><a                  
+                          ction0813><action3941><acti                  
+                          on3941><right_control_1><ac                  
+                          tion0322><action1323><actio                  
+                          n0206><action0480><action24                  
+                          31><action0992><action0381>                  
+                          <action0381><right_control_                  
+                          2><action2856><action3127><                  
+                          action3382><action3975><act                  
+                          ion3365><action1825><action                  
+                          4049><action2912><right_con                  
+                          trol_3><action0776><action1                  
+                          843><action2421><action0815                  
+                          ><action2194><action1443><a                  
+                          ction1598><action0602>|']                    
+06/20 [14:59:57] INFO     | >> Decoded       input_preprocessor.py:1116
+                          action [0]:                                  
+                          <right_control_0><                           
+                          action2144><action                           
+                          3311><action2144><                           
+                          action3459><action                           
+                          2144><action0813><                           
+                          action3941><action                           
+                          3941><right_contro                           
+                          l_1><action0322><a                           
+                          ction1323><action0                           
+                          206><action0480><a                           
+                          ction2431><action0                           
+                          992><action0381><a                           
+                          ction0381><right_c                           
+                          ontrol_2><action28                           
+                          56><action3127><ac                           
+                          tion3382><action39                           
+                          75><action3365><ac                           
+                          tion1825><action40                           
+                          49><action2912><ri                           
+                          ght_control_3><act                           
+                          ion0776><action184                           
+                          3><action2421><act                           
+                          ion0815><action219                           
+                          4><action1443><act                           
+                          ion1598><action060                           
+                          2>                                           
+                 WARNING  | >> Dropped absent       serve_policy.py:373
+                          action keys                                  
+                          ['left_control',                             
+                          'left_gripper',                              
+                          'right_gripper']                             
+                          (emb=so100); client must                     
+                          handle missing keys.                         
+                 INFO     | >> Recompute: 43056.8ms serve_policy.py:382
+                          (next 0 from cache)                          
+                 ERROR    | >> Inference request    serve_policy.py:432
+                          failed                                       
+                          ╭─ Traceback (most rece─╮                    
+                          │ /home/fenghao/workspa │                    
+                          │ ce/GalaxeaVLA/Galaxea │                    
+                          │ VLA/scripts/serve_pol │                    
+                          │ icy.py:428 in handler │                    
+                          │                       │                    
+                          │   425 │   │   │   │   │                    
+                          │   426 │   │   │   │   │                    
+                          │   427 │   │   │   │   │                    
+                          │ ❱ 428 │   │   │   │   │                    
+                          │   429 │   │   │   exc │                    
+                          │   430 │   │   │   │   │                    
+                          │   431 │   │   │   exc │                    
+                          │                       │                    
+                          │ /home/fenghao/workspa │                    
+                          │ ce/GalaxeaVLA/Galaxea │                    
+                          │ VLA/.venv/lib/python3 │                    
+                          │ .10/site-packages/web │                    
+                          │ sockets/asyncio/conne │                    
+                          │ ction.py:485 in send  │                    
+                          │                       │                    
+                          │    482 │   │   │   │  │                    
+                          │    483 │   │          │                    
+                          │    484 │   │   elif i │                    
+                          │ ❱  485 │   │   │   as │                    
+                          │    486 │   │   │   │  │                    
+                          │    487 │   │   │   │  │                    
+                          │    488 │   │   │   │  │                    
+                          │                       │                    
+                          │ /home/fenghao/.local/ │                    
+                          │ share/uv/python/cpyth │                    
+                          │ on-3.10.16-linux-x86_ │                    
+                          │ 64-gnu/lib/python3.10 │                    
+                          │ /contextlib.py:199 in │                    
+                          │ __aenter__            │                    
+                          │                       │                    
+                          │   196 │   │   # they  │                    
+                          │   197 │   │   del sel │                    
+                          │   198 │   │   try:    │                    
+                          │ ❱ 199 │   │   │   ret │                    
+                          │   200 │   │   except  │                    
+                          │   201 │   │   │   rai │                    
+                          │   202                 │                    
+                          │                       │                    
+                          │ /home/fenghao/workspa │                    
+                          │ ce/GalaxeaVLA/Galaxea │                    
+                          │ VLA/.venv/lib/python3 │                    
+                          │ .10/site-packages/web │                    
+                          │ sockets/asyncio/conne │                    
+                          │ ction.py:965 in       │                    
+                          │ send_context          │                    
+                          │                       │                    
+                          │    962 │   │   │   se │                    
+                          │    963 │   │   │   #  │                    
+                          │    964 │   │   │   aw │                    
+                          │ ❱  965 │   │   │   ra │                    
+                          │    966 │              │                    
+                          │    967 │   def send_d │                    
+                          │    968 │   │   """    │                    
+                          ╰───────────────────────╯                    
+                          ConnectionClosedError:                       
+                          received 1011 (internal                      
+                          error); then sent 1011                       
+                          (internal error)                             
+                 INFO     | >> Client disconnected: serve_policy.py:437
+                          ('127.0.0.1', 37394)                         
+06/20 [15:03:42] INFO     | >> connection open                                                            server.py:531
+                 INFO     | >> Client connected: ('127.0.0.1', 52322) (action_steps=1)              serve_policy.py:410
+06/20 [15:03:44] INFO     | >> [CoT]                                                                  g05_policy.py:837
+                          ['<right_control_0><action1808><action3311><action2144><action1450><action2                  
+                          144><action0813><action3043><action3043><right_control_1><action0572><actio                  
+                          n1323><action0206><action1881><action1297><action0636><action3462><action34                  
+                          62><right_control_2><action2712><action3127><action3382><action0046><action                  
+                          2682><action3365><action3831><action3008><right_control_3><action2089><acti                  
+                          on3357><action1494><action3158><action3357><action3431><action1808><action3                  
+                          883>|']                                                                                      
+                 INFO     | >> Decoded action [1]:                                           input_preprocessor.py:1116
+                          <right_control_0><action1808><action3311><action2144><action1450><                           
+                          action2144><action0813><action3043><action3043><right_control_1><a                           
+                          ction0572><action1323><action0206><action1881><action1297><action0                           
+                          636><action3462><action3462><right_control_2><action2712><action31                           
+                          27><action3382><action0046><action2682><action3365><action3831><ac                           
+                          tion3008><right_control_3><action2089><action3357><action1494><act                           
+                          ion3158><action3357><action3431><action1808><action3883>                                     
+                 WARNING  | >> Dropped absent action keys ['left_control', 'left_gripper',          serve_policy.py:373
+                          'right_gripper'] (emb=so100); client must handle missing keys.                               
+                 INFO     | >> Recompute: 1649.2ms (next 0 from cache)                              serve_policy.py:382
+06/20 [15:03:46] INFO     | >> [CoT]                                                                  g05_policy.py:837
+                          ['<right_control_0><action1808><action3311><action2144><action1450><action2                  
+                          144><action0813><action3043><action3043><right_control_1><action0572><actio                  
+                          n1323><action0206><action1881><action1297><action0636><action3462><action34                  
+                          62><right_control_2><action2712><action3127><action3382><action0046><action                  
+                          2682><action3365><action3831><action3008><right_control_3><action2089><acti                  
+                          on3357><action1494><action3158><action3357><action3431><action1808><action3                  
+                          883>|']                                                                                      
+06/20 [15:03:47] INFO     | >> Decoded action [2]:                                           input_preprocessor.py:1116
+                          <right_control_0><action1808><action3311><action2144><action1450><                           
+                          action2144><action0813><action3043><action3043><right_control_1><a                           
+                          ction0572><action1323><action0206><action1881><action1297><action0                           
+                          636><action3462><action3462><right_control_2><action2712><action31                           
+                          27><action3382><action0046><action2682><action3365><action3831><ac                           
+                          tion3008><right_control_3><action2089><action3357><action1494><act                           
+                          ion3158><action3357><action3431><action1808><action3883>                                     
+                 WARNING  | >> Dropped absent action keys ['left_control', 'left_gripper',          serve_policy.py:373
+                          'right_gripper'] (emb=so100); client must handle missing keys.                               
+                 INFO     | >> Recompute: 1649.5ms (next 0 from cache)                              serve_policy.py:382
+                 INFO     | >> Client disconnected: ('127.0.0.1', 52322)      ”
+
+Show more
+
+Sunday 3:04 AM
+
+
+
+
+
+
+Worked for 1m 18s
+
+
+
+主故障已经定位：服务器第一次真正推理用了 43.1 秒，而本机 client 只等 30 秒就超时退出了。 网络、SSH 隧道、两台相机、COM24、权重加载都已经成功。
+时间线是：
+02:59:11  本机启动 client
+02:59:14  两个相机 + SO101 follower 都连接成功
+02:59:15  WebSocket handshake 成功：{'action_steps': 1}
+02:59:15  本机发送第一帧图像/状态，进入 warmup 推理
+02:59:45  本机等待满 30 秒，超时并关闭连接
+02:59:56  服务器刚完成第一次推理：43056.8ms
+02:59:57  服务器尝试回传动作，但 client 已断开，报 1011
+本机 traceback 的关键行是：
+g05_so101_policy_client.py line 221
+await asyncio.wait_for(websocket.recv(), timeout=args.timeout_s)
+asyncio.exceptions.TimeoutError
+args.timeout_s 默认是 30 秒。它发生在 warmup 阶段：client 已成功把第一组 exterior + wrist_right + wrist_left 黑图 + state + prompt 发给 server，只是没能等到结果。
+服务器日志也直接证明了这一点：
+Recompute: 43056.8ms (next 0 from cache)
+也就是第一次模型推理约 43 秒。
+这不是 torch.compile 的首轮编译，因为你明确设置了：
+model.use_torch_compile=false
+首次推理仍可能很慢：CUDA runtime、attention kernel、显存分配、处理器路径和模型中某些 lazy 初始化，都会在第一次真实输入时触发。后面的日志显示同一 server 后续推理已降到：
+Recompute: 1649.2ms
+Recompute: 1649.5ms
+约 1.65 秒，说明模型真正跑通了，首次 43 秒是冷启动现象。
+服务器中的：
+ConnectionClosedError: received 1011
+是后果，不是根因：client 超时关闭 WebSocket 后，server 计算完成才尝试发送结果，发现对方已经不在了。
+第二个错误是独立问题：
+cv2.error ... cvDestroyAllWindows ... GUI: NONE
+你当前 lerobot 环境中的 OpenCV 编译信息显示：
+GUI: NONE
+因此没有窗口界面支持。client 在异常清理时调用：
+cv2.destroyAllWindows()
+又触发了这个报错。它没有造成推理超时，只是遮住了原始 TimeoutError 的收尾过程。
+你现在最安全的下一次 dry run 应该同时做两件事：
+禁用 client 的 OpenCV 窗口；
+把等待 server 的上限提高到至少 120 秒。
+当前 PowerShell wrapper 还没有暴露 TimeoutS 参数，因此先直接运行 Python client：
+& "C:\Users\19142\.conda\envs\lerobot\python.exe" `
+  .\scripts\g0.5\g05_so101_policy_client.py `
+  --host 127.0.0.1 `
+  --port 8765 `
+  --task "pick up the white block" `
+  --robot-port COM24 `
+  --robot-id fenghao_so101_follower `
+  --fixed-camera 2 `
+  --wrist-camera 0 `
+  --camera-fps 15 `
+  --action-fps 15 `
+  --max-step-deg 2 `
+  --max-steps 20 `
+  --warmup-infers 1 `
+  --timeout-s 120 `
+  --dry-run `
+  --no-display
+这仍是 dry run：不会执行 G0.5 动作。
+若这次成功，预期会看到：
+G0.5 server handshake: {'action_steps': 1}
+warmup 1/1: received action
+step=000 dry-run target=[...]
+补充两点：
+服务器的 Python 3.10、pynvml deprecated、tokenizer_meta、图像 shape override 警告，都不是这次超时的根因。
+action_steps=1 使后续每一步都要重新推理。现在 server 稳定推理约 1.65 秒，所以实际控制频率会远低于你设置的 15 Hz；这对 dry run 和首次低速真机更安全，但不适合追求流畅高速动作。
+下一步建议是把 [run_g05_so101_client.ps1 (line 1)](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\run_g05_so101_client.ps1:1) 加上 -TimeoutS 和自动 -NoDisplay 处理，避免你每次手写长命令。
+
+Sunday 3:05 AM
+
+
+
+
+
+
+我没懂你这个"固定相机 → exterior 
+腕部相机 → wrist_right"是什么意思，我看你的run.ps1里写的似乎就是fix和wrist这两个名字，相机编号0和2是对的上的，你说的这个exterior是让我确认什么？还有就是这个相机输入到模型里的图片有没有经过裁剪？如何能看到这个画面？我希望能确认一下输入到服务器上的是什么样的画面。另外就是 这个“MaxStepDeg=2”是正常的吗？“scripts\g0.5\run_g05_so101_client.ps1”你给的这些参数都是官方默认参数吗
+
+
+
+Sunday 5:31 AM
+
+
+
+
+
+
+Worked for 5m 24s
+
+
+
+你理解得对：fixed / wrist 是你熟悉的“物理相机角色”；exterior / wrist_right 是 G0.5 模型协议里的“图像槽位名”。两者不是两套相机。
+对应关系是：
+物理相机	Windows 编号	本机参数	发给 G0.5 的图像键
+固定桌面相机	2	FixedCameraIndex / --fixed-camera	exterior
+腕部相机	0	WristCameraIndex / --wrist-camera	wrist_right
+不存在的左腕相机	无	无	wrist_left，自动发送黑图
+
+所以你不是要再确认一个名为 exterior 的设备；你要确认的是：
+编号 2 的真实画面，是否确实是固定在桌面旁、能看到机械臂和物体的广角视角；
+编号 0 的真实画面，是否确实是安装在腕部、会随末端一起移动的近景视角。
+wrist_right 也不表示“画面右边的相机”；它只是 G0.5 对单臂 SO101 腕部视角采用的标准模型键名。若把两张图反着发送，模型不会报错，但会把“桌面全景”误当成“手腕视角”，效果会很差。
+你的本机代码实际做的是：
+"exterior":    OpenCVCameraConfig(index_or_path=FixedCameraIndex)
+"wrist_right": OpenCVCameraConfig(index_or_path=WristCameraIndex)
+再将它们发给服务器：
+"images": {
+    "exterior":    固定相机图,
+    "wrist_left":  黑图,
+    "wrist_right": 腕部相机图,
+}
+图像有没有裁剪？
+有两层，需要分开看。
+第一层：本机 → 服务器的原始网络输入。
+本机要求两路相机返回严格的：
+RGB, uint8, 640 × 480
+然后只做：
+HWC: 480 × 640 × 3
+→
+CHW: 3 × 480 × 640
+这里没有裁剪、没有缩放、没有翻转、没有 padding；只是把通道维度从最后移到最前，供 PyTorch 使用。
+第二层：服务器内部 → 模型输入。
+服务器拿到 3×480×640 后，会执行：
+torchvision.transforms.Resize([256, 256])
+因此图像会直接从：
+640 × 480，4:3
+缩放为：
+256 × 256，1:1
+这不是 crop；它会保留整张画面，但会改变长宽比，视觉上相当于压成正方形。之后才做：
+\[
+x \leftarrow x / 255
+\]\[
+x \leftarrow (x - 0.5) / 0.5
+\]把像素转换到大致 \([-1,1]\) 范围。推理阶段没有训练时的随机颜色扰动或随机裁剪。
+如何看见实际输入画面？
+我已经给 [run_g05_so101_client.ps1 (line 1)](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\run_g05_so101_client.ps1:1) 加了保存首帧的参数。你的 OpenCV 当前是 GUI: NONE，不能可靠弹出 imshow 窗口，所以保存 PNG 更可靠。
+运行 dry run：
+cd D:\workspace\Manipulation\so101
+
+.\scripts\g0.5\run_g05_so101_client.ps1 `
+  -Task "pick up the white block" `
+  -DumpObservationDir .\outputs\g05_input_check
+它不会发送动作到 COM24。
+输出目录会有：
+outputs/g05_input_check/
+├── sent_exterior_rgb_640x480.png
+├── sent_wrist_right_rgb_640x480.png
+├── sent_wrist_left_rgb_640x480.png
+├── server_resize_preview_exterior_rgb_256x256.png
+├── server_resize_preview_wrist_right_rgb_256x256.png
+├── server_resize_preview_wrist_left_rgb_256x256.png
+└── observation_metadata.json
+其中：
+sent_*.png：就是实际 msgpack 发给服务器的 RGB 像素，只是转回可查看的 PNG 格式；这是最重要的核对项。
+server_resize_preview_*.png：模拟服务器第一步 Resize([256,256]) 后的视觉效果。
+wrist_left 应当是一张纯黑图，这是预期行为。
+observation_metadata.json：保存 prompt、模型坐标系下的关节状态、输入频率和图像协议说明。
+先重点确认：
+sent_exterior_rgb_640x480.png     是固定全景
+sent_wrist_right_rgb_640x480.png  是腕部近景
+如果两张图反了，运行时交换参数即可：
+-FixedCameraIndex 0 -WristCameraIndex 2
+但按你此前 Pi0.5 的记录，fixed=2, wrist=0 原本是正确的；先看 dump，不要凭编号猜。
+MaxStepDeg=2 正常吗？
+它是我为第一次真机测试设的保守安全值，不是 G0.5 官方默认值。
+它限制的是一次命令相对当前关节状态最多变化多少。client 先计算：
+\[
+\Delta q = q_{\text{target}} - q_{\text{current}}
+\]若某一维的最大绝对变化超过 2，则整个动作向量按比例缩小：
+\[
+q_{\text{sent}}
+=
+q_{\text{current}}
++
+\Delta q \cdot
+\frac{2}{\max_i |\Delta q_i|}
+\]因此，一次命令中任何关节都不会被要求跳超过 2。
+此外，本机 LeRobot 的 max_relative_target=2 还会再做一层硬件侧保护。两层都在 [g05_so101_policy_client.py (line 100)](D:\\workspace\\Manipulation\\so101\\scripts\\g0.5\\g05_so101_policy_client.py:100) 中。
+严格说，名字 MaxStepDeg 对前五个机械臂关节是“度”；夹爪在 LeRobot 内部是 \(0\sim100\) 的开合范围，仍会被同一个数值限制。
+它在当前阶段合适，因为：
+你还在验证方向、相机槽位、关节坐标转换；
+当前 action_steps=1，每步都重新观察；
+server 现在单次推理约 1.65 秒，因此真实控制速率远低于 15 Hz；
+先慢一些，能把错误控制在小范围内。
+确认一小段真实动作方向完全正确后，可考虑逐步试 3，再到 4；不要直接跳到 10。
+哪些参数是官方默认，哪些是为你定制的？
+不是所有参数都是官方默认。当前脚本里混合了“官方协议要求”“你硬件的实际值”“我加的安全设置”。
+参数	当前值	来源
+FixedCameraIndex	2	你的 Pi0.5 已有配置，不是官方通用值
+WristCameraIndex	0	你的 Pi0.5 已有配置，不是官方通用值
+exterior / wrist_right / wrist_left	固定槽位	G0.5 SO100/SO101 官方数据协议
+PolicyPort	8765	G0.5 serve_policy.py 默认端口
+action-fps	15	G0.5 SO100 client 的推荐/默认控制频率
+camera-fps	15	本机部署选择，不是模型强制要求
+MaxStepDeg	2	本机首轮安全设置；上游 client 默认更大
+MaxSteps	20	本机首轮安全设置
+WarmupInfers	1	本机首轮链路与 CUDA warmup 设置
+TimeoutS	120	针对你第一次 43 秒冷启动而加的设置
+默认 dry run	是	本机安全设置，不是上游默认
+默认不显示窗口	是	因为你的 OpenCV 没有 GUI backend
+server action_steps	1	首轮安全设置；上游 server 默认通常是 16，SO100 脚本常用 32
+torch.compile=false	是	首轮调试设置；上游 SO100 server 脚本倾向启用它
+
+所以：exterior/wrist_right、三相机槽位、SO100 embodiment 是模型协议；2/0 是你的硬件；2°、20 steps、dry run、120 秒超时、action_steps=1 都是为了第一次真机测试而刻意收紧的保护措施。
+
+README.mdDocument · MDOpen previewOpen in
+
+Edited 3 files+80-1Review changesUndoReview
+
+scripts/g0.5/README.md+11-0
+scripts/g0.5/g05_so101_policy_client.py+60-0
+scripts/g0.5/run_g05_so101_client.ps1+9-1
+
+
+
+
+Sunday 5:36 AM

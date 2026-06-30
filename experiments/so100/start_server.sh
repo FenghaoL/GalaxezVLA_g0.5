@@ -30,3 +30,6 @@ python "$PROJECT/scripts/serve_policy.py" \
   model.model_weights_to_bf16=true \
   model.use_torch_compile=true \
   model.model_arch.attn_implementation=sdpa
+
+
+# CUDA_VISIBLE_DEVICES=0 bash experiments/so100/start_server.sh   checkpoints/g05-so101/checkpoints/model_state_dict.pt

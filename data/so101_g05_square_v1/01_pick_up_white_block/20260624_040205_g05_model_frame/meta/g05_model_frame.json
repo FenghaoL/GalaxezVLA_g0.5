@@ -1,0 +1,24 @@
+{
+  "source_root": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/so101_g05_square_v1/01_pick_up_white_block/20260624_040205",
+  "coordinate_transform": {
+    "formula": "q_model = signs * q_arm + offsets",
+    "signs": [
+      1,
+      -1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "offsets_degrees": [
+      0,
+      90,
+      90,
+      0,
+      0,
+      0
+    ]
+  },
+  "videos": "symlinked from source; no re-encoding",
+  "total_frames": 149
+}

@@ -1,0 +1,463 @@
+这部分我没懂，讲清楚一点，这个G0.5接受的是什么样的东西，输出的又是什么？针对不同checkpoint不一样吗？so101对应的是什么？你是从什么地方的范围看出来的吗？这几个关节角都是角度吗？用的范围的数值是什么。为我讲清楚。“这不表示谁“错了”。G0.5 client 明确做了坐标变换：
+model_state = signs * lerobot_state + offsets
+signs   = [1, -1, 1, 1, 1, 1]
+offsets = [0, 90, 90, 0, 0, 0] degrees
+也就是说，G0.5 checkpoint 的统计是变换后的 model frame；而你的 pi0.5 stats 属于旧 OpenPI/SO101 pipeline。两边的 6 个数字不能按位置直接相减，更不能拿 pi0.5 stats 给 G0.5 做归一化或动作反归一化。
+pi0.5 的配置确实把前五维关节 action 转成相对当前 state 的增量，gripper 不转；G0.5 则把全部六维 target 减去当前 state。这个差异也能从 stats 看出：pi0.5 gripper action 均值约 21.4，而 G0.5 的 relative gripper action 均值约 -2.0。两者不能作为“动作幅度大小”的直接比较。[OpenPI SO101 配置](/home/fenghao/workspace/openpi/openpi/src/openpi/training/config.py) · [G0.5 relative action 变换](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/src/g05/data_processor/transforms/relative_action.py)”
+
+
+
+
+Sunday 6:20 AM
+
+
+
+
+
+
+Worked for 2m 5s
+
+
+
+你抓到的核心疑问很对：同样叫 “state/action”，不同模型里的含义不一定相同。先给结论：
+G0.5 的 SO101 部署，输入是“图像 + 当前 6 维机器人状态 + 文本任务”。
+模型内部预测的是未来动作的相对变化。
+server 最终返回给 client 的是“当前这一控制步要到达的 6 维绝对目标”。
+前五维是关节角度；第六维是 gripper 的开合位置，不应把它理解成角度。
+g05-so101 虽然 checkpoint 名叫 SO101，但代码里的本体名是 so100；这是该仓库给 SO-100/101 共用的单臂适配器名称。部署 SO101 时仍应使用 eval_embodiment=so100，不要改成 so101。
+先把 6 维向量说清楚
+G0.5 client 固定定义顺序为：
+[shoulder_pan, shoulder_lift, elbow_flex,
+ wrist_flex, wrist_roll, gripper]
+前五项：关节角度，单位是度 °。
+最后一项：夹爪开合位置，通常是 LeRobot/Feetech 的 0–100 一类数值，不是“第六个角度”。
+一次控制循环实际发生什么
+SO101 实际读数
+[pan°, lift°, elbow°, wrist_flex°, wrist_roll°, gripper]
+
+        │  G0.5 client 的坐标系变换
+        ▼
+
+G0.5 model frame 的 state
+[pan°, 90-lift°, elbow+90°, wrist_flex°, wrist_roll°, gripper]
+
+        │  用 g05-so101 的 dataset_stats 做归一化
+        ▼
+
+G0.5 模型
+输入：三路图像槽位 + 6维 state + 语言任务
+内部预测：未来 32 步、相对当前 state 的动作
+
+        │  反归一化 + 加回当前 state
+        ▼
+
+server 缓存 32 步绝对目标
+
+        │  每次只发其中 1 步
+        ▼
+
+SO101 client
+转换回 LeRobot 坐标系 + 单步限幅
+        ▼
+发送给机械臂
+这里的“32 步”很容易误解：
+checkpoint 配置的 action horizon 是 32；
+模型一次确实预测一个 32 步动作片段；
+但 WebSocket server 会缓存这个片段，每次回复 client 时只发其中第 1、2、3……步的一个 6 维目标；
+32 步用完后才再次要求 client 发送新图像和 state，重新推理。
+所以实际收到的每个 server 回复是：
+{"action": {"right_arm": [6 个数]}}
+不是一次把 32×6 的矩阵直接交给机械臂。这个行为由 server 的 ChunkedPolicyWrapper 明确实现。[serve_policy.py](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/serve_policy.py)
+signs 和 offsets 到底在做什么
+它们不是归一化，也不是根据你的 pi0.5 stats 算出的；它们是 G0.5 repo 作者针对“当前 LeRobot 坐标”与“G0.5 SO10x 训练坐标”写死的坐标变换：
+model_state = signs * arm_state + offsets
+signs   = [1, -1, 1, 1, 1, 1]
+offsets = [0, 90, 90, 0, 0, 0]
+逐项展开就是：
+物理 SO101 读数	送进 G0.5 的值
+shoulder_pan	shoulder_pan
+shoulder_lift	90 - shoulder_lift
+elbow_flex	elbow_flex + 90
+wrist_flex	wrist_flex
+wrist_roll	wrist_roll
+gripper	gripper
+
+例如你机械臂当前是：
+arm_state = [3.1, -34.3, 31.5, 55.9, -12.3, 13.4]
+送到模型的 state 就是：
+model_state = [3.1, 124.3, 121.5, 55.9, -12.3, 13.4]
+这恰好就是 G0.5 SO100 训练数据的均值姿态。反向把模型动作发给机械臂时，会做完全相反的计算：
+arm_target = (model_target - offsets) * signs
+这段逻辑就在 [so100_policy_client.py](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/experiments/so100/so100_policy_client.py)。
+“范围”具体是从哪里来的
+我给你的范围不是机械臂的硬件限位，也不是我猜的；它直接来自：
+checkpoints/g05-so101/dataset_stats.json
+└── so100
+    └── state
+        └── right_arm
+            ├── global_q01
+            └── global_q99
+q01 与 q99 分别是训练数据中该维度的 1% 和 99% 分位数。可以把它理解成：G0.5 在训练时最常见的 98% 姿态范围。
+下面左列是 stats 文件里的 G0.5 model frame；右列是把它反变换成你 SO101 实际读数后的范围：
+维度	G0.5 model frame 的 q01–q99	对应 SO101 实际读数范围
+shoulder_pan	-71.1 ~ 92.6°	-71.1 ~ 92.6°
+shoulder_lift	24.7 ~ 196.3°	-106.3 ~ 65.3°
+elbow_flex	6.9 ~ 182.4°	-83.1 ~ 92.4°
+wrist_flex	-79.5 ~ 104.3°	-79.5 ~ 104.3°
+wrist_roll	-156.9 ~ 174.2°	-156.9 ~ 174.2°
+gripper	-2.9 ~ 66.1	-2.9 ~ 66.1
+
+再次强调：这不是“允许活动范围”。机械硬件的安全限位仍以你的 SO101 校准结果为准；这个表只是模型看过什么姿态的分布范围。
+pi0.5 与 G0.5 的 action 为什么不能直接比较
+pi0.5 的 SO101 配置是：
+前 5 维：action - current_state
+第 6 维 gripper：保持绝对值
+也就是 pi0.5 内部的 action 类似：
+[Δpan, Δlift, Δelbow, Δwrist_flex, Δwrist_roll, gripper_absolute]
+G0.5 则是：
+[Δpan, Δlift, Δelbow, Δwrist_flex, Δwrist_roll, Δgripper]
+它对六维都做相对于当前 state 的变换。[OpenPI 的 mask `(5, -1)`](/home/fenghao/workspace/openpi/openpi/src/openpi/training/config.py) · [G0.5 的全 6 维 relative transform](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/src/g05/data_processor/transforms/relative_action.py)
+所以：
+pi0.5 gripper action 平均值约 21.4，常反映“夹爪绝对开度”；
+G0.5 gripper action 平均值约 -2.0，反映“相对当前开度的变化”。
+它们数字都叫 action，但语义不同，不能比较“大不大”，更绝不能把一个 stats 文件放进另一个模型。
+不同 checkpoint 会不同吗？
+会，而且这是很重要的规则。
+一个可部署 checkpoint 实际上是：
+模型权重
++ .hydra/config.yaml
++ dataset_stats.json
++ action tokenizer
+它们共同规定：
+输入需要几路图像、每路叫什么；
+state/action 的维度和顺序；
+state/action 的坐标系和归一化统计；
+action horizon；
+动作是关节角、末端位姿，还是其他表示。
+g05-so101 的配置选择了 so100 processor：三图像槽位、6 维单臂 state/action、32 步 horizon、q01/q99 归一化。[g05-so101 配置](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml)
+因此：
+g05-so101 + SO101 client：正确；
+g05-droid + SO101 client：错误；
+g05-libero + SO101 client：错误；
+pi0.5 的 stats + G0.5 checkpoint：错误。
+你可以把它理解成：模型权重只会“说”它训练时那种坐标语言；stats 和 processor 就是这门语言的词典与语法。
+
+Sunday 6:22 AM
+
+
+
+
+
+
+我现在要尝试直接接入so101操控机械臂了（不是dry run）直接用experiments/so100/start_server.sh合适吗？在端口8765就可以，为我提供合适的命令，不要太复杂，注意在往后你给的方案中，都考虑我的可读性，不用加太多机制，给最直接的命令就行，参数只加必要的
+
+
+
+Sunday 8:23 AM
+
+
+
+
+
+
+合适。start_server.sh 就是这个 repo 给 SO100/SO101 的正式推理 server 脚本，默认端口就是 8765。
+在 GPU server 上运行：
+cd /home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA
+source .venv/bin/activate
+CUDA_VISIBLE_DEVICES=0 bash experiments/so100/start_server.sh \
+  checkpoints/g05-so101/checkpoints/model_state_dict.pt
+它会启动在 0.0.0.0:8765，并使用 g05-so101 权重。第一次真正推理会有一次 torch.compile 编译，可能等几分钟；之后才会稳定。
+如果 SO101 就接在这台 server 上，另开一个终端运行：
+cd /home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA
+conda activate lerobot
+CONDA_PYTHON="$CONDA_PREFIX/bin/python" bash experiments/so100/start_client.sh
+但正式第一次执行，我建议只改两处必要设置：
+相机编号：start_client.sh 里的 exterior:4 wrist_right:0 必须是你真实相机；
+初次执行把 --max-step-deg 10 改成 --max-step-deg 5。
+若机械臂接在另一台电脑，不能直接用 start_client.sh，因为它写死了 localhost；把其中的：
+--host localhost
+改成 GPU server 的内网 IP，例如：
+--host 192.168.x.x
+第一次 live 时，机械臂会自动回到 G0.5 的预设起始姿态，然后等待你在窗口里输入任务。桌面先清空、手边保持可断电/急停。
+
+Sunday 8:24 AM
+
+
+
+
+
+
+帮我看一下，目前来说这个服务建立起来之后，接受的数据和输出的数据分别是什么样子的？输出的是完整的模型输出吗？有包括那个自然语言的subtask之类的吗？结合相关代码，为我讲解清楚
+
+
+
+Sunday 1:12 PM
+
+
+
+
+
+
+Worked for 1m 35s
+
+
+
+当前服务传输的是 MessagePack 二进制包；下面用“JSON 形状”展示，便于理解。
+最重要的结论：
+client 发给 server 的是：图像、当前机械臂状态、自然语言任务。
+server 发回来的不是完整模型输出，而是“当前应执行的一个 6 维关节目标”。
+服务可以额外带回 cot_text，但没有单独结构化的 subtask 字段。
+模型内部一次预测 32 步；server 把它缓存起来，每次只发其中 1 步给机械臂。
+1. client → server：发送什么
+第一次推理、或 32 步缓存用完时，SO101 client 发：
+{
+  "images": {
+    "exterior":    uint8_array[3, 480, 640],
+    "wrist_right": uint8_array[3, 480, 640],
+    "wrist_left":  uint8_array[3, 480, 640],  # 没有实体相机时是黑图
+  },
+  "state": {
+    "right_arm": float32_array[6],
+  },
+  "task": "pick up the red block",
+  "embodiment_type": "so100",
+  "frequency": 15.0,
+}
+其中：
+图像是 RGB、CHW 排列，不是常见的 HWC；
+state.right_arm 是已经经过 signs/offsets 转换后的 G0.5 model frame；
+task 是你输入的自然语言；
+embodiment_type: "so100" 是选择 SO-100/101 单臂 processor 的内部名字；
+frequency=15 表示控制频率。
+这些字段由 SO101 client 组装。[client 组包逻辑](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/experiments/so100/so100_policy_client.py)
+server 收到后会：
+检查图像 key、图像形状、state 是否为 6 维；
+图像从原始 480×640 预处理为模型用的 256×256；
+用 dataset_stats.json 归一化 state；
+进行模型推理。
+验证和内部输入构造在 [serve_policy.py](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/serve_policy.py)。
+2. server → client：真正回什么
+每次 server 回的是：
+{
+  "action": {
+    "right_arm": float32_array[6],
+  },
+  "need_obs": False,
+  "cot_text": "..."  # 可选
+}
+right_arm 的六个数是：
+[shoulder_pan, shoulder_lift, elbow_flex,
+ wrist_flex, wrist_roll, gripper]
+并且已经是：
+已从模型内部归一化空间还原；
+已从“相对当前 state 的动作”加回当前 state；
+因而它是 G0.5 model frame 下的绝对目标位置。
+client 随后才把它转换回真实 SO101 的 LeRobot frame，并按 --max-step-deg 限制单步移动，再发送给电机。[接收与执行逻辑](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/experiments/so100/so100_policy_client.py)
+所以，server 回的不是“增量动作”，也不是 32×6 的完整数组，而是当前这一小步的 6 维绝对目标。
+3. 32 步 action chunk 是怎么工作的
+模型内部一次产生未来 32 步：
+内部 action chunk: [32, 6]
+但你用的 start_server.sh 设置了：
+--action_steps 32
+所以 server 会：
+第 1 次：client 发图像+state → 模型推理 32 步 → server 回第 1 步
+第 2~32 次：client 发 {} → server 从缓存回第 2~32 步
+第 33 次：client 再发新的图像+state → 模型重新推理
+need_obs 就是在告诉 client “下一次是否要重新拍照并发送完整观测”。
+need_obs: false：下次只发 {}，继续使用缓存动作；
+need_obs: true：下次必须发图像、state、task，重新规划。
+这段缓存逻辑写得很明确：server 的函数注释就是“返回单步 action”。[ChunkedPolicyWrapper](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/serve_policy.py)
+4. 有没有自然语言 subtask？
+有可能有 cot_text，但它不是一个固定、可靠、结构化的：
+{"subtask": "..."}
+G0.5 checkpoint 当前配置：
+predict_cot: true
+因此模型会先尝试生成一段文本，再生成动作。server 会把该文本作为顶层字段：
+"cot_text": "..."
+发回来。[G05 checkpoint 配置](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml)
+它可能包含：
+Subtask: grasp the cup
+也可能包含目标框、相机 affordance 或其他 reasoning 文本；也可能为空或质量不稳定。client Dashboard 会尝试把其中的 BBox / 相机坐标画到画面上。
+但要注意一个关键限制：这个 g05-so101 的部署模板实际选的是 BaseSamplesBuilder，也就是“最小 VLA 模板、没有强制 CoT 格式”。尽管训练中混入过 Subtask / BBox 等 CoT 数据，部署时并没有要求模型必须产生 Subtask: ...。
+因此最准确的说法是：
+服务可能返回一段自由文本 cot_text；它可以作为观察模型 reasoning 的辅助信息，但不应把它当作稳定的任务规划 API，更不能据此控制机械臂。
+
+配置里确实训练混合了多个 CoT builder，但推理用的是 base builder。[CoT builder 配置](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml)
+5. 什么没有被 server 发出来
+模型内部还会产生或经过：
+原始生成 token；
+action token；
+32 步完整 action chunk；
+action mask；
+generated_ids；
+logits / 中间特征；
+CoT 的 token 序列。
+这些都不会通过当前 WebSocket 协议返回。
+server 做的是“控制服务”，不是“完整模型调试服务”：它保留 action chunk 在 server 内存中，只把当前一步 action 和可选 cot_text 发出。推理包装层也会主动丢掉大部分内部字段，只保留后处理后的 action。[inferencer 输出裁剪路径](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/src/g05/models/g05/inferencer.py)
+一句话总结：
+输入：RGB 图像 + 当前 6维状态 + 自然语言任务
+输出：当前一步 6维关节目标 + 是否需要新观测 + 可选 cot_text
+不是完整模型输出；cot_text 有可能包含 subtask，但没有独立、稳定的 subtask 字段。
+
+Sunday 1:14 PM
+
+
+
+
+
+
+我想知道基于“CUDA_VISIBLE_DEVICES=0 bash experiments/so100/start_server.sh   checkpoints/g05-so101/checkpoints/model_state_dict.pt”这个的服务，到底会不会返回cot，我目前似乎没有在我的本地端接收到cot。是完全没有传输吗
+
+
+
+
+Monday 10:15 AM
+
+
+
+
+
+
+Worked for 55s
+
+
+
+不是“完全没有传输”。按当前代码，g05-so101 的 server 会尝试生成并传输 CoT；但 SO101 client 收到后会做一层很严格的过滤，所以你在本地 Dashboard 看不到，不等于网络上没收到。
+当前 checkpoint 配置明确是：
+predict_cot: true
+模型推理时会先生成文本，再生成动作。[配置](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml) · [模型推理阶段](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/src/g05/models/g05/g05_policy.py)
+server 端的行为是：
+cot_text = action.pop("_cot_text", None)
+
+resp = {"action": action, "need_obs": ...}
+if cot_text is not None:
+    resp["cot_text"] = cot_text
+也就是说，只要模型生成的 cot_text 不是 None，它就会放进 WebSocket 回复里。[server 回包逻辑](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/serve_policy.py)
+真正的问题在 client 端：
+cot = response.get("cot_text")
+if cot is not None:
+    if _is_valid_cot(cot):
+        self._cot_text = cot
+    else:
+        self._cot_text = None
+也就是：client 先收到了，再决定是否丢掉。[SO101 client](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/experiments/so100/so100_policy_client.py)
+它只保留两种文本：
+含有 BBox:、camera:、<loc...>；
+或至少有 3 个由空格分开的纯英文单词。
+因此以下情况都会被 client 丢弃：
+Subtask: pick cup
+这里只有一个纯英文词 pick，Subtask: 因为带冒号不算，cup 是第二个，所以过滤失败。
+更典型的是中文 CoT：
+拿起红色方块
+中文通常没有空格，过滤器把它看作一个 token，也会失败。
+还有第三层：Dashboard 显示前会主动删除 BBox: ... 和相机 affordance 文本；所以即使模型返回的是纯 BBox CoT，Dashboard 也可能最终显示空白。
+因此，“本地没看到 CoT”最可能是：
+模型生成 cot_text
+→ server 已传输
+→ client 收到
+→ _is_valid_cot 认为格式不够像有效 CoT
+→ client 置为 None
+→ Dashboard 不显示
+另外，CoT 不是每个 15 Hz 控制步都重新生成。你当前 server 使用 --action_steps 32：
+第一次新观测：模型生成一次 CoT + 32 步动作；
+后续 31 个缓存动作：server 复用同一段 CoT；
+第 33 步的新观测：才重新生成下一段 CoT。
+当前 server 已经在运行；这个 host 上没有看到 SO101 client 进程，因此如果 client 在另一台电脑上，这是正常的。
+最小验证办法是在 client 的下面这一行之后：
+response = await client.infer(raw_obs)
+临时加一行：
+logger.info("[RAW COT] %r", response.get("cot_text"))
+放在过滤逻辑之前。这样就能一眼判断：
+输出是 None：模型/服务端没有给 CoT；
+输出是空字符串：模型生成了空 CoT；
+输出有文本但 Dashboard 空白：就是 client 过滤或显示清洗导致。
+我建议先做这个观察，不要先改模型或 server。
+
+Monday 10:16 AM
+
+
+
+
+
+
+所以目前来看，你能查到或者推断出，官方给我的这个so101机械臂的权重是在什么数据集上训练的吗？这个是单臂还是双臂？
+
+
+
+
+Monday 12:11 PM
+
+
+
+
+
+
+Worked for 2m 45s
+
+
+
+结论先说：
+这个 g05-so101 的公开说明是：G0.5 在“14 种机器人本体的示范数据 + 大规模网页/具身 VQA 数据”上预训练；官方把它标为用于 SO-100/101 的零样本部署权重。
+但官方没有公开写清：g05-so101 是否又专门用某个 SO101 数据集做过后训练、具体用了哪些 SO101 episode、各数据集占比多少。因此不能严谨地说“它就是在某某 SO101 数据集上训练的”。
+对你的 SO101 来说，它是单臂部署，不是双臂。
+为什么这样判断：
+官方 README 只在总体层面说明 G0.5 的预训练来源：14 类机器人示范数据，以及网页和具身 VQA 数据；同时明确将 g05-so101 写为 “SO-100/101 零样本部署”。这意味着你不需要先采集自己的 SO101 数据再训练，便可直接尝试运行；但“零样本”不等于官方一定从未见过任何 SO100/SO101 风格数据。
+官方 README 的预训练说明 · 官方 g05-so101 权重页
+
+你的 checkpoint 配置里同时保留了两个本体的处理器：so100 和 galaxea_r1lite。这说明该导出包携带了这两类本体的输入输出格式和统计量；不等同于公开的训练数据清单。dataset_stats.json 能证明存在按 SO10x 格式统计的数据分布，但不能单靠它证明这些数据以何种方式参与了参数训练。
+[checkpoint 配置 (line 501)](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml:501)
+
+单臂的证据很直接：当服务以 eval_embodiment=so100 运行时，激活的 action/state 都只有一个 right_arm，维度都是 6：
+action: right_arm, raw_shape: 6
+state:  right_arm, raw_shape: 6
+这 6 维就是你的 SO101 的五个机械臂关节加夹爪。没有 left_arm，所以服务不会给第二条手臂产生动作。
+[SO10x 专用 action/state 配置 (line 509)](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml:509)
+你看到的 wrist_left / wrist_right 别误会：它们是相机视角槽位，不是左右两条机械臂。反过来，在同一份配置的 R1 Lite 部分，确实出现了独立的 left_arm、left_gripper、right_arm、right_gripper；这说明 G0.5 的通用骨干能覆盖双臂本体，但你当前运行的 SO101 分支只取其中的单臂 6 维接口。
+[R1 Lite 双臂配置对照 (line 650)](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/checkpoints/g05-so101/.hydra/config.yaml:650)
+
+Monday 12:14 PM
+
+
+
+
+
+
+我会整理一份可直接交给服务器端 Codex 的 handoff：本地数据格式、关节坐标转换、相机/裁剪契约、必须上传的文件，以及训练后部署时不能混用的统计量与…
+
+目前我采集了一些数据,在"data/so101_g05_square_v1"里,然后复制文件里是本地的codex给出的一些信息,也许你需要参考,现在我需要你为我整理出一些.sh script,使我能够通过直接运行这些script来对checkpoints里so101的那个checkpoint进行微调,我准备尝试微调4epoch,有一点需要注意,这些数据的视频每两段"episodes"之间可能夹了reset 环境时候的视频,我看了一下"data/so101_g05_square_v1/01_pick_up_white_block/20260624_041146/meta/episodes/chunk-000/file-000.parquet",里面的""videos/observation.images.wrist/to_timestamp""这种每个episodes在视频里的起始时间是准确的,但是结束时间包含了多余的视频,所以按理说应该以其实时间为准读取视频,然后根据"data/so101_g05_square_v1/01_pick_up_white_block/20260624_041146/data/chunk-000/file-000.parquet"里的timestamp来取出image,不过我觉得这个repo的训练逻辑可能本来就是这样?如果是这样的话应该也不需要做什么额外的事.注意,我需要你帮我把整个微调的链路都打通,数据处理等全部做好,并且把你用的.sh文件留下,也许可以用环境"fenghao@chickadee:~/workspace/GalaxeaVLA/GalaxeaVLA$  source /home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/.venv/bin/activate 
+(g05) fenghao@chickadee:~/workspace/GalaxeaVLA/GalaxeaVLA$ ". 在最后确保你的微调脚本准确无误的写好了,并且在后台成功运行,查看日志能够正常输出训练之后,再结束任务.wandb在当前环境中应该已经登录.把你写的代码和输出都放在scripts里的一个新开的独立目录下
+
+Show more
+
+7:59 AM
+
+
+
+
+
+
+Worked for 15m 26s
+
+
+
+数据和脚本已准备完成：
+生成了 11 个 *_g05_model_frame prepared 数据集：共 125 episodes、20,756 帧；原始数据未修改，视频未重编码。
+验证了 state/action 均已转为 G0.5 model frame，真实视频可由 repo adapter 正常读取；reset 尾视频不会进入训练。
+修正了两个运行环境问题：强制 PyAV 解码，以及取消 BF16 权重强转（保留 BF16 AMP）。
+脚本位于 [scripts/so101_square_finetune](/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/so101_square_finetune)。
+初次训练已成功加载 checkpoint、计算 fresh stats 并进入首个 forward，但在 Liger CE 处暴露 BF16 权重 dtype 冲突；脚本已修正为 FP32 权重、batch 4/GPU。随后执行环境额度限制阻止我重新启动并验证首个优化 step，因此不能诚实地称它已在正常训练。
+恢复执行后直接运行：
+bash scripts/so101_square_finetune/stop_run.sh so101_square_4ep_20260623_201124
+bash scripts/so101_square_finetune/start_background.sh
+bash scripts/so101_square_finetune/tail_log.sh
+第二条会启动修正后的 4×A100、4 epoch 训练；所有训练产物会在 scripts/so101_square_finetune/runs/so100/<run-name>/，其中的 dataset_stats.json 必须与最终 checkpoint 一起部署。
+
+1 memory citationMEMORY.mdlines 56-62G0.5 canonical fine-tuning and serving entrypoint context
+README.mdDocument · MDOpen previewOpen in
+
+Edited 12 files+869-0Review changesUndoReview
+
+scripts/so101_square_finetune/README.md+73-0
+scripts/so101_square_finetune/force_pyav.py+15-0
+scripts/so101_square_finetune/prepare_data.sh+8-0
+Show 9 more files
