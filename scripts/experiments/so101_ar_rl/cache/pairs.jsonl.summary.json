@@ -1,0 +1,123 @@
+{
+  "labels_root": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1",
+  "label_files": [
+    "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_105023/rl_rollout_labels_prepared.jsonl",
+    "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_110907/rl_rollout_labels_prepared.jsonl",
+    "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_114422/rl_rollout_labels_prepared.jsonl",
+    "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_120130/rl_rollout_labels_prepared.jsonl",
+    "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_130619/rl_rollout_labels_prepared.jsonl"
+  ],
+  "excluded_episode_uids": [
+    "20260701_114422_ep00003"
+  ],
+  "usable_labels": 52,
+  "success_episodes": 27,
+  "failure_episodes": 25,
+  "pairs": 85,
+  "buckets": [
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_001",
+      "success": 3,
+      "failure": 3,
+      "pairs": 9,
+      "success_sources": {
+        "intervention": 3
+      },
+      "failure_sources": {
+        "autonomous": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_002",
+      "success": 4,
+      "failure": 4,
+      "pairs": 16,
+      "success_sources": {
+        "intervention": 4
+      },
+      "failure_sources": {
+        "autonomous": 4
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_003",
+      "success": 4,
+      "failure": 3,
+      "pairs": 12,
+      "success_sources": {
+        "intervention": 4
+      },
+      "failure_sources": {
+        "intervention": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_004",
+      "success": 4,
+      "failure": 3,
+      "pairs": 12,
+      "success_sources": {
+        "intervention": 4
+      },
+      "failure_sources": {
+        "autonomous": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_005",
+      "success": 3,
+      "failure": 3,
+      "pairs": 9,
+      "success_sources": {
+        "intervention": 3
+      },
+      "failure_sources": {
+        "intervention": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_006",
+      "success": 3,
+      "failure": 3,
+      "pairs": 9,
+      "success_sources": {
+        "intervention": 3
+      },
+      "failure_sources": {
+        "intervention": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_008",
+      "success": 3,
+      "failure": 3,
+      "pairs": 9,
+      "success_sources": {
+        "autonomous": 3
+      },
+      "failure_sources": {
+        "autonomous": 3
+      }
+    },
+    {
+      "instruction": "Pick up the white block.",
+      "init_config_id": "bucket_009",
+      "success": 3,
+      "failure": 3,
+      "pairs": 9,
+      "success_sources": {
+        "intervention": 3
+      },
+      "failure_sources": {
+        "intervention": 3
+      }
+    }
+  ]
+}

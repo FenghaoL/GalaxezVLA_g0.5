@@ -1,0 +1,11 @@
+{
+  "format": "g05_so101_ar_dpo_ref_logps/v1",
+  "base_checkpoint": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/so101_square_finetune/runs/so100/so101_square_4ep_20260623_205729/checkpoints/step_9740.pt",
+  "pairs_path": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/experiments/so101_ar_rl/cache/pairs.jsonl",
+  "pairs_sha256": "29498491be31d9fc6bc10de5aa9fbe359430e0e7c8f9ff2e1fa79e778c0f1fd6",
+  "anchor_count": 1,
+  "labels_root": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1",
+  "excluded_episode_uids": [
+    "20260701_114422_ep00003"
+  ]
+}

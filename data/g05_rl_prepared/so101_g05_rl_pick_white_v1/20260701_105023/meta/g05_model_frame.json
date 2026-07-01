@@ -1,0 +1,25 @@
+{
+  "source_root": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_raw/so101_g05_rl_pick_white_v1/20260701_105023",
+  "prepared_root": "/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/data/g05_rl_prepared/so101_g05_rl_pick_white_v1/20260701_105023",
+  "coordinate_transform": {
+    "formula": "q_model = signs * q_arm + offsets",
+    "signs": [
+      1,
+      -1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "offsets_degrees": [
+      0,
+      90,
+      90,
+      0,
+      0,
+      0
+    ]
+  },
+  "videos": "symlinked from source; no re-encoding",
+  "total_frames": 875
+}
