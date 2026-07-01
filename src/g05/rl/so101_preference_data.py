@@ -4,7 +4,8 @@ These wrappers deliberately reuse the existing LeRobot dataset and processor.
 They only change which already-processed samples are exposed to the trainer:
 
 * SuccessFrameDataset: all frames from successful labelled episodes.
-* PreferencePairDataset: fixed anchor frames from success/failure episode pairs.
+* PreferencePairDataset: fixed anchors or sliding windows from success/failure
+  episode pairs.
 
 The raw/prepared LeRobot roots remain untouched.
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -332,8 +334,87 @@ def _anchor_indices(ep_range: EpisodeRange, anchor_count: int) -> list[tuple[int
     ]
 
 
+def _contiguous_indices(
+    ep_range: EpisodeRange,
+    start_offset: int,
+    window_size: int,
+) -> list[tuple[int, int]]:
+    start_offset = int(np.clip(start_offset, 0, max(0, ep_range.length - 1)))
+    window_size = max(1, int(window_size))
+    end_offset = min(ep_range.length, start_offset + window_size)
+    return [
+        (ep_range.dataset_idx, ep_range.local_start + off)
+        for off in range(start_offset, end_offset)
+    ]
+
+
+def _window_start_pairs(
+    chosen_range: EpisodeRange,
+    rejected_range: EpisodeRange,
+    *,
+    window_size: int,
+    window_stride: int,
+    window_align: str,
+    max_windows_per_pair: int = 0,
+) -> list[tuple[int, int, int]]:
+    """Return (chosen_start, rejected_start, effective_window_size) tuples.
+
+    ``window_align=index`` mirrors GRAPE's direct sliding-window intuition:
+    window i in the chosen trajectory is paired with window i in the rejected
+    trajectory, truncated to the shorter trajectory.
+
+    ``window_align=relative`` uses the shorter trajectory to decide how many
+    windows to expose, but maps those windows over the full relative progress of
+    both trajectories. This keeps the tail of a longer success/failure episode
+    visible when episode lengths differ.
+    """
+
+    window_stride = max(1, int(window_stride))
+    effective_window_size = max(
+        1, min(int(window_size), int(chosen_range.length), int(rejected_range.length))
+    )
+    chosen_possible = max(1, int(chosen_range.length) - effective_window_size + 1)
+    rejected_possible = max(1, int(rejected_range.length) - effective_window_size + 1)
+    window_align = str(window_align or "relative").lower()
+
+    starts: list[tuple[int, int, int]] = []
+    if window_align == "index":
+        possible = min(chosen_possible, rejected_possible)
+        for start in range(0, possible, window_stride):
+            starts.append((start, start, effective_window_size))
+        last = possible - 1
+        if starts and starts[-1][0] != last:
+            starts.append((last, last, effective_window_size))
+        elif not starts:
+            starts.append((0, 0, effective_window_size))
+    elif window_align == "relative":
+        chosen_count = int(math.ceil(chosen_possible / window_stride))
+        rejected_count = int(math.ceil(rejected_possible / window_stride))
+        count = max(1, min(chosen_count, rejected_count))
+        rels = [0.5] if count == 1 else np.linspace(0.0, 1.0, count).tolist()
+        seen: set[tuple[int, int]] = set()
+        for rel in rels:
+            chosen_start = int(round(float(rel) * (chosen_possible - 1)))
+            rejected_start = int(round(float(rel) * (rejected_possible - 1)))
+            key = (chosen_start, rejected_start)
+            if key in seen:
+                continue
+            seen.add(key)
+            starts.append((chosen_start, rejected_start, effective_window_size))
+    else:
+        raise ValueError(f"Unsupported rl.window_align={window_align!r}; use relative or index")
+
+    max_windows_per_pair = int(max_windows_per_pair or 0)
+    if max_windows_per_pair > 0 and len(starts) > max_windows_per_pair:
+        keep = np.linspace(0, len(starts) - 1, max_windows_per_pair)
+        keep_idx = sorted({int(round(x)) for x in keep.tolist()})
+        starts = [starts[i] for i in keep_idx]
+
+    return starts
+
+
 class PreferencePairDataset(Dataset):
-    """Return chosen/rejected fixed-anchor sample groups for AR-DPO."""
+    """Return chosen/rejected fixed-anchor or sliding-window groups for AR-DPO."""
 
     def __init__(
         self,
@@ -341,6 +422,11 @@ class PreferencePairDataset(Dataset):
         pairs_path: str | Path,
         labels_root: str | Path,
         anchor_count: int = 4,
+        sample_mode: str = "anchor",
+        window_size: int = 8,
+        window_stride: int = 4,
+        window_align: str = "relative",
+        max_windows_per_pair: int = 0,
         exclude_episode_uids: Optional[Iterable[str]] = None,
         ref_logps_path: str | Path | None = None,
     ):
@@ -348,20 +434,25 @@ class PreferencePairDataset(Dataset):
         self.pairs_path = Path(pairs_path)
         self.labels_root = Path(labels_root)
         self.anchor_count = int(anchor_count)
+        self.sample_mode = str(sample_mode or "anchor").lower()
+        self.window_size = int(window_size)
+        self.window_stride = int(window_stride)
+        self.window_align = str(window_align or "relative").lower()
+        self.max_windows_per_pair = int(max_windows_per_pair or 0)
         self.exclude_episode_uids = set(exclude_episode_uids or [])
         self.labels = load_labels(labels_root, self.exclude_episode_uids)
         self.episode_index = EpisodeIndex(base_dataset, self.labels)
-        self.pairs = read_jsonl(self.pairs_path)
+        self.raw_pairs = read_jsonl(self.pairs_path)
         self.ref_logps_path = Path(ref_logps_path) if ref_logps_path else None
         self.ref_logps: dict[str, dict[str, float]] = {}
         if self.ref_logps_path and self.ref_logps_path.exists():
             self.load_ref_logps(self.ref_logps_path)
 
-        self._chosen_indices: list[list[tuple[int, int]]] = []
-        self._rejected_indices: list[list[tuple[int, int]]] = []
+        self.items: list[dict[str, Any]] = []
         kept_pairs: list[dict[str, Any]] = []
         skipped_pairs: list[str] = []
-        for pair in self.pairs:
+        skipped_short_pairs: list[str] = []
+        for pair in self.raw_pairs:
             pair_id = str(pair.get("pair_id") or f"pair_{len(kept_pairs):05d}")
             try:
                 chosen_range = self.episode_index.by_pair_ref(pair["chosen"])
@@ -370,30 +461,82 @@ class PreferencePairDataset(Dataset):
                 skipped_pairs.append(pair_id)
                 continue
             kept_pairs.append(pair)
-            self._chosen_indices.append(_anchor_indices(chosen_range, self.anchor_count))
-            self._rejected_indices.append(_anchor_indices(rejected_range, self.anchor_count))
-        self.raw_pair_count = len(self.pairs)
+            if self.sample_mode == "anchor":
+                self.items.append(
+                    {
+                        "pair": pair,
+                        "pair_id": pair_id,
+                        "base_pair_id": pair_id,
+                        "sample_mode": "anchor",
+                        "window_index": None,
+                        "chosen_indices": _anchor_indices(chosen_range, self.anchor_count),
+                        "rejected_indices": _anchor_indices(rejected_range, self.anchor_count),
+                    }
+                )
+            elif self.sample_mode == "window":
+                windows = _window_start_pairs(
+                    chosen_range,
+                    rejected_range,
+                    window_size=self.window_size,
+                    window_stride=self.window_stride,
+                    window_align=self.window_align,
+                    max_windows_per_pair=self.max_windows_per_pair,
+                )
+                if not windows:
+                    skipped_short_pairs.append(pair_id)
+                    continue
+                for window_idx, (chosen_start, rejected_start, effective_size) in enumerate(windows):
+                    self.items.append(
+                        {
+                            "pair": pair,
+                            "pair_id": f"{pair_id}_w{window_idx:04d}",
+                            "base_pair_id": pair_id,
+                            "sample_mode": "window",
+                            "window_index": window_idx,
+                            "chosen_window_start": chosen_start,
+                            "rejected_window_start": rejected_start,
+                            "window_size": effective_size,
+                            "chosen_indices": _contiguous_indices(
+                                chosen_range, chosen_start, effective_size
+                            ),
+                            "rejected_indices": _contiguous_indices(
+                                rejected_range, rejected_start, effective_size
+                            ),
+                        }
+                    )
+            else:
+                raise ValueError(
+                    f"Unsupported rl.sample_mode={self.sample_mode!r}; use anchor or window"
+                )
+        self.raw_pair_count = len(self.raw_pairs)
         self.pairs = kept_pairs
         self.skipped_pair_ids = skipped_pairs
+        self.skipped_short_pair_ids = skipped_short_pairs
 
         self.summary = {
             "raw_pairs": self.raw_pair_count,
             "trainable_pairs": len(self.pairs),
+            "train_samples": len(self.items),
+            "sample_mode": self.sample_mode,
             "anchor_count": self.anchor_count,
+            "window_size": self.window_size,
+            "window_stride": self.window_stride,
+            "window_align": self.window_align,
+            "max_windows_per_pair": self.max_windows_per_pair,
             "pairs_path": str(self.pairs_path),
             "ref_logps_loaded": len(self.ref_logps),
             "skipped_episode_uids": sorted(self.episode_index.skipped_episode_uids),
             "skipped_pair_ids": self.skipped_pair_ids,
+            "skipped_short_pair_ids": self.skipped_short_pair_ids,
             "buckets": dict(Counter(str(p.get("init_config_id") or "") for p in self.pairs)),
         }
         logger.info("[SO101 AR-DPO] %s", self.summary)
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.items)
 
     def _pair_id(self, idx: int) -> str:
-        pair = self.pairs[int(idx)]
-        return str(pair.get("pair_id") or f"pair_{int(idx):05d}")
+        return str(self.items[int(idx)]["pair_id"])
 
     def load_ref_logps(self, path: str | Path) -> None:
         path = Path(path)
@@ -410,20 +553,21 @@ class PreferencePairDataset(Dataset):
         logger.info("[SO101 AR-DPO] loaded %s cached reference logps from %s", len(refs), path)
 
     def has_complete_ref_logps(self) -> bool:
-        return all(self._pair_id(i) in self.ref_logps for i in range(len(self.pairs)))
+        return all(self._pair_id(i) in self.ref_logps for i in range(len(self.items)))
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         idx = int(idx)
-        pair = self.pairs[idx]
-        pair_id = self._pair_id(idx)
+        item = self.items[idx]
+        pair = item["pair"]
+        pair_id = str(item["pair_id"])
         ref = self.ref_logps.get(pair_id, {})
         chosen = [
             _get_mixture_inner_sample(self.base_dataset, dataset_idx, local_idx)
-            for dataset_idx, local_idx in self._chosen_indices[idx]
+            for dataset_idx, local_idx in item["chosen_indices"]
         ]
         rejected = [
             _get_mixture_inner_sample(self.base_dataset, dataset_idx, local_idx)
-            for dataset_idx, local_idx in self._rejected_indices[idx]
+            for dataset_idx, local_idx in item["rejected_indices"]
         ]
         return {
             "pair_id": pair_id,
@@ -433,6 +577,12 @@ class PreferencePairDataset(Dataset):
             "ref_rejected_logp": float(ref.get("ref_rejected_logp", 0.0)),
             "pair_meta": {
                 "pair_id": pair_id,
+                "base_pair_id": item.get("base_pair_id"),
+                "sample_mode": item.get("sample_mode"),
+                "window_index": item.get("window_index"),
+                "window_size": item.get("window_size"),
+                "chosen_window_start": item.get("chosen_window_start"),
+                "rejected_window_start": item.get("rejected_window_start"),
                 "instruction": pair.get("instruction"),
                 "init_config_id": pair.get("init_config_id"),
                 "chosen_uid": pair.get("chosen", {}).get("episode_uid"),

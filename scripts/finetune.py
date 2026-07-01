@@ -446,6 +446,11 @@ def _wrap_rl_dataset_if_needed(cfg: DictConfig, train_dataset):
             pairs_path=pairs_path,
             labels_root=labels_root,
             anchor_count=int(cfg.rl.get("anchor_count", 4)),
+            sample_mode=str(cfg.rl.get("sample_mode", "anchor")),
+            window_size=int(cfg.rl.get("window_size", 8)),
+            window_stride=int(cfg.rl.get("window_stride", 4)),
+            window_align=str(cfg.rl.get("window_align", "relative")),
+            max_windows_per_pair=int(cfg.rl.get("max_windows_per_pair", 0)),
             exclude_episode_uids=exclude_episode_uids,
             ref_logps_path=cfg.rl.get("ref_logps_path", None),
         )
@@ -459,7 +464,13 @@ def _build_ref_cache_metadata(cfg: DictConfig, train_dataset: PreferencePairData
         "base_checkpoint": ckpt,
         "pairs_path": str(train_dataset.pairs_path),
         "pairs_sha256": sha256_file(train_dataset.pairs_path),
+        "sample_mode": str(train_dataset.sample_mode),
         "anchor_count": int(train_dataset.anchor_count),
+        "window_size": int(train_dataset.window_size),
+        "window_stride": int(train_dataset.window_stride),
+        "window_align": str(train_dataset.window_align),
+        "max_windows_per_pair": int(train_dataset.max_windows_per_pair),
+        "train_samples": int(len(train_dataset)),
         "labels_root": str(train_dataset.labels_root),
         "excluded_episode_uids": sorted(train_dataset.exclude_episode_uids),
     }
@@ -681,6 +692,7 @@ def finetune(cfg: DictConfig):
         model.configure_ar_dpo(
             beta=float(cfg.rl.get("beta", 0.1)),
             chosen_ce_weight=float(cfg.rl.get("chosen_ce_weight", 0.2)),
+            logp_micro_batch_size=int(cfg.rl.get("logp_micro_batch_size", 0)),
         )
 
     with accelerator.main_process_first():
@@ -1309,26 +1321,76 @@ def finetune(cfg: DictConfig):
                             loss_value_dict = unwrap_model(model)._ar_dpo_loss_dict(dpo_terms)
                             last_action_loss = float(dpo_terms["total_loss"].detach().item())
 
-                            chosen_surrogate_batch = dict(batch)
-                            chosen_surrogate_batch["_dpo_surrogate_side"] = "chosen"
-                            chosen_surrogate_batch["_dpo_chosen_coeff"] = dpo_terms[
-                                "chosen_coeff"
-                            ]
-                            chosen_loss, _ = model(chosen_surrogate_batch)
-                        normalized_loss = chosen_loss / cfg.model.grad_accumulation_steps
-                        normalized_loss.backward()
-                        del chosen_loss, normalized_loss, chosen_surrogate_batch
+                        backward_micro_batch_size = int(
+                            cfg.rl.get(
+                                "backward_micro_batch_size",
+                                cfg.rl.get("logp_micro_batch_size", 0),
+                            )
+                            or 0
+                        )
+                        dpo_policy = unwrap_model(model)
 
-                        with accelerator.autocast():
-                            rejected_surrogate_batch = dict(batch)
-                            rejected_surrogate_batch["_dpo_surrogate_side"] = "rejected"
-                            rejected_surrogate_batch["_dpo_rejected_coeff"] = dpo_terms[
-                                "rejected_coeff"
-                            ]
-                            rejected_loss, _ = model(rejected_surrogate_batch)
-                        normalized_loss = rejected_loss / cfg.model.grad_accumulation_steps
-                        normalized_loss.backward()
-                        del rejected_loss, normalized_loss, rejected_surrogate_batch, dpo_terms
+                        def _backward_dpo_surrogate_side(side: str) -> None:
+                            coeff_key = (
+                                "_dpo_chosen_coeff"
+                                if side == "chosen"
+                                else "_dpo_rejected_coeff"
+                            )
+                            term_key = "chosen_coeff" if side == "chosen" else "rejected_coeff"
+                            side_batch = batch[side]
+                            side_batch_size = dpo_policy._infer_collated_batch_size(side_batch)
+                            can_split_window = (
+                                backward_micro_batch_size > 0
+                                and int(batch["anchor_counts"].numel()) == 1
+                                and side_batch_size > backward_micro_batch_size
+                            )
+                            if not can_split_window:
+                                with accelerator.autocast():
+                                    surrogate_batch = dict(batch)
+                                    surrogate_batch["_dpo_surrogate_side"] = side
+                                    surrogate_batch[coeff_key] = dpo_terms[term_key]
+                                    loss, _ = model(surrogate_batch)
+                                normalized_loss = loss / cfg.model.grad_accumulation_steps
+                                normalized_loss.backward()
+                                del loss, normalized_loss, surrogate_batch
+                                return
+
+                            for start_idx in range(
+                                0,
+                                side_batch_size,
+                                backward_micro_batch_size,
+                            ):
+                                end_idx = min(
+                                    side_batch_size,
+                                    start_idx + backward_micro_batch_size,
+                                )
+                                with accelerator.autocast():
+                                    surrogate_batch = dict(batch)
+                                    surrogate_batch[side] = dpo_policy._slice_collated_batch(
+                                        side_batch,
+                                        start=start_idx,
+                                        end=end_idx,
+                                        batch_size=side_batch_size,
+                                    )
+                                    surrogate_batch["anchor_counts"] = torch.tensor(
+                                        [end_idx - start_idx],
+                                        dtype=batch["anchor_counts"].dtype,
+                                        device=batch["anchor_counts"].device,
+                                    )
+                                    surrogate_batch["_dpo_surrogate_side"] = side
+                                    surrogate_batch[coeff_key] = dpo_terms[term_key]
+                                    if side == "chosen":
+                                        surrogate_batch["_dpo_chosen_ce_token_denom"] = dpo_terms[
+                                            "chosen_token_count_sum"
+                                        ]
+                                    loss, _ = model(surrogate_batch)
+                                normalized_loss = loss / cfg.model.grad_accumulation_steps
+                                normalized_loss.backward()
+                                del loss, normalized_loss, surrogate_batch
+
+                        _backward_dpo_surrogate_side("chosen")
+                        _backward_dpo_surrogate_side("rejected")
+                        del dpo_terms
                     else:
                         with accelerator.autocast():
                             _monitor = get_global_monitor()

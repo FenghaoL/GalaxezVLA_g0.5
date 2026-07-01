@@ -9,7 +9,16 @@ BASE_CKPT="$ROOT/scripts/so101_square_finetune/runs/so100/so101_square_4ep_20260
 DATA_YAML="$SCRIPT_DIR/configs/so101_ar_rl_data.yaml"
 PAIRS_PATH="$SCRIPT_DIR/cache/pairs.jsonl"
 ANCHOR_COUNT="${ANCHOR_COUNT:-1}"
-REF_LOGPS_PATH="$SCRIPT_DIR/cache/ref_logps_step9740_anchors${ANCHOR_COUNT}.jsonl"
+DPO_SAMPLE_MODE="${DPO_SAMPLE_MODE:-window}"
+WINDOW_SIZE="${WINDOW_SIZE:-8}"
+WINDOW_STRIDE="${WINDOW_STRIDE:-4}"
+WINDOW_ALIGN="${WINDOW_ALIGN:-relative}"
+MAX_WINDOWS_PER_PAIR="${MAX_WINDOWS_PER_PAIR:-0}"
+if [[ "$DPO_SAMPLE_MODE" == "window" ]]; then
+  REF_LOGPS_PATH="$SCRIPT_DIR/cache/ref_logps_step9740_window${WINDOW_SIZE}_stride${WINDOW_STRIDE}_${WINDOW_ALIGN}_max${MAX_WINDOWS_PER_PAIR}.jsonl"
+else
+  REF_LOGPS_PATH="$SCRIPT_DIR/cache/ref_logps_step9740_anchors${ANCHOR_COUNT}.jsonl"
+fi
 
 cd "$ROOT"
 source "$ROOT/.venv/bin/activate"
@@ -60,7 +69,12 @@ python -m torch.distributed.run \
   +rl.labels_root="$ROOT/data/g05_rl_prepared/so101_g05_rl_pick_white_v1" \
   +rl.pairs_path="$PAIRS_PATH" \
   +rl.ref_logps_path="$REF_LOGPS_PATH" \
+  +rl.sample_mode="$DPO_SAMPLE_MODE" \
   +rl.anchor_count="$ANCHOR_COUNT" \
+  +rl.window_size="$WINDOW_SIZE" \
+  +rl.window_stride="$WINDOW_STRIDE" \
+  +rl.window_align="$WINDOW_ALIGN" \
+  +rl.max_windows_per_pair="$MAX_WINDOWS_PER_PAIR" \
   +rl.ref_batch_size=1 \
   +rl.ref_num_workers=0 \
   +rl.beta=0.1 \

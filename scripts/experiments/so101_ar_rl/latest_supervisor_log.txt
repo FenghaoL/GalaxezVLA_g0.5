@@ -1,1 +1,1 @@
-/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/experiments/so101_ar_rl/runs/background/supervisor_20260701_032551.log
+/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/experiments/so101_ar_rl/runs/background/supervisor_20260701_150325.log

@@ -32,6 +32,17 @@ show_run() {
   local run_dir
   run_dir="$(cat "$file")"
   echo "Run dir: $run_dir"
+  local matches
+  matches="$(pgrep -af "$run_dir" || true)"
+  if [[ -z "$matches" ]]; then
+    matches="$(pgrep -af "$(basename "$run_dir")" || true)"
+  fi
+  if [[ -n "$matches" ]]; then
+    echo "Process: running"
+    echo "$matches" | head -5
+  else
+    echo "Process: not found by pgrep"
+  fi
   if [[ -d "$run_dir/checkpoints" ]]; then
     find "$run_dir/checkpoints" -maxdepth 1 -type f -name '*.pt' | sort | tail -5
   else
@@ -51,5 +62,3 @@ if [[ -f "$SCRIPT_DIR/latest_supervisor_log.txt" ]]; then
 fi
 
 show_run "DPO" "$SCRIPT_DIR/latest_dpo_run.txt"
-show_run "SFT" "$SCRIPT_DIR/latest_sft_run.txt"
-

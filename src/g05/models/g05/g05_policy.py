@@ -272,6 +272,7 @@ class G05Policy(BasePolicy):
         self._fwd_step = 0
         self._ar_dpo_beta = 0.1
         self._ar_dpo_chosen_ce_weight = 0.2
+        self._ar_dpo_logp_micro_batch_size = 0
 
         # --- Train-time accuracy accumulator (grad-accum aware) ---
         # Each micro-batch pushes three accuracies (overall/action_token/cot).
@@ -496,10 +497,17 @@ class G05Policy(BasePolicy):
     def predict_action(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return self.forward(batch, inference_mode=True)
 
-    def configure_ar_dpo(self, *, beta: float = 0.1, chosen_ce_weight: float = 0.2) -> None:
+    def configure_ar_dpo(
+        self,
+        *,
+        beta: float = 0.1,
+        chosen_ce_weight: float = 0.2,
+        logp_micro_batch_size: int = 0,
+    ) -> None:
         """Configure lightweight AR-DPO loss coefficients."""
         self._ar_dpo_beta = float(beta)
         self._ar_dpo_chosen_ce_weight = float(chosen_ce_weight)
+        self._ar_dpo_logp_micro_batch_size = max(0, int(logp_micro_batch_size or 0))
 
     @staticmethod
     def _build_vqa_template(num_images: int) -> str:
@@ -595,6 +603,53 @@ class G05Policy(BasePolicy):
     # Training
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _infer_collated_batch_size(batch: Dict[str, Any]) -> int:
+        samples = batch.get("samples")
+        if isinstance(samples, list):
+            return len(samples)
+        for value in batch.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+            if isinstance(value, dict):
+                for nested in value.values():
+                    if isinstance(nested, torch.Tensor) and nested.ndim > 0:
+                        return int(nested.shape[0])
+        raise ValueError("Unable to infer collated batch size for AR-DPO microbatching")
+
+    @classmethod
+    def _slice_collated_batch(
+        cls,
+        value: Any,
+        *,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> Any:
+        if isinstance(value, torch.Tensor):
+            if value.ndim > 0 and int(value.shape[0]) == batch_size:
+                return value[start:end]
+            return value
+        if isinstance(value, dict):
+            return {
+                key: cls._slice_collated_batch(
+                    nested, start=start, end=end, batch_size=batch_size
+                )
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            if len(value) == batch_size:
+                return value[start:end]
+            return value
+        if isinstance(value, tuple):
+            if len(value) == batch_size:
+                return value[start:end]
+            return tuple(
+                cls._slice_collated_batch(nested, start=start, end=end, batch_size=batch_size)
+                for nested in value
+            )
+        return value
+
     def compute_ar_action_logps(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Compute differentiable action-token logprobs for an already collated batch."""
         samples = batch["samples"]
@@ -634,6 +689,60 @@ class G05Policy(BasePolicy):
         )
         return self.model.ar_helper.cal_action_logps(vlm_hidden, labels, self.model)
 
+    def compute_ar_action_logps_microbatched(
+        self,
+        batch: Dict[str, Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute action-token logprobs while splitting the collated sample axis.
+
+        Window DPO treats several trajectory frames as one preference item.  The
+        mathematical score is still the sum of all frame logprobs in that window;
+        this helper only changes how the VLM forward/backward graph is staged in
+        memory.
+        """
+        batch_size = self._infer_collated_batch_size(batch)
+        micro_batch_size = (
+            self._ar_dpo_logp_micro_batch_size
+            if micro_batch_size is None
+            else int(micro_batch_size or 0)
+        )
+        if micro_batch_size <= 0 or batch_size <= micro_batch_size:
+            return self.compute_ar_action_logps(batch)
+
+        logps: list[torch.Tensor] = []
+        token_counts: list[torch.Tensor] = []
+        nll_sum: Optional[torch.Tensor] = None
+        token_sum: Optional[torch.Tensor] = None
+
+        for start in range(0, batch_size, micro_batch_size):
+            end = min(batch_size, start + micro_batch_size)
+            sub_batch = self._slice_collated_batch(
+                batch,
+                start=start,
+                end=end,
+                batch_size=batch_size,
+            )
+            out = self.compute_ar_action_logps(sub_batch)
+            logps.append(out["logps"])
+            token_counts.append(out["token_counts"])
+            chunk_token_sum = out["token_counts"].to(dtype=out["ce_loss"].dtype).sum()
+            chunk_nll_sum = out["ce_loss"] * chunk_token_sum
+            nll_sum = chunk_nll_sum if nll_sum is None else nll_sum + chunk_nll_sum
+            token_sum = chunk_token_sum if token_sum is None else token_sum + chunk_token_sum
+
+        merged_logps = torch.cat(logps, dim=0)
+        merged_token_counts = torch.cat(token_counts, dim=0)
+        assert nll_sum is not None and token_sum is not None
+        ce_loss = nll_sum / token_sum.clamp_min(1.0)
+        mean_token_logp = merged_logps / merged_token_counts.clamp_min(1.0)
+        return {
+            "logps": merged_logps,
+            "token_counts": merged_token_counts,
+            "ce_loss": ce_loss,
+            "mean_token_logp": mean_token_logp,
+        }
+
     def compute_ar_dpo_terms(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """Compute AR-DPO terms and first-order surrogate coefficients."""
         chosen_batch = batch["chosen"]
@@ -672,6 +781,7 @@ class G05Policy(BasePolicy):
             "reward_accuracy": reward_accuracy,
             "chosen_coeff": chosen_coeff.detach(),
             "rejected_coeff": rejected_coeff.detach(),
+            "chosen_token_count_sum": chosen_out["token_counts"].sum().detach(),
         }
 
     def _ar_dpo_loss_dict(self, terms: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -709,11 +819,21 @@ class G05Policy(BasePolicy):
         coeff_key = "_dpo_chosen_coeff" if side == "chosen" else "_dpo_rejected_coeff"
         coeff = batch[coeff_key].to(device=device, dtype=torch.float32).detach()
 
-        side_out = self.compute_ar_action_logps(batch[side])
+        side_out = self.compute_ar_action_logps_microbatched(batch[side])
         side_logp = aggregate_anchor_logps(side_out["logps"], anchor_counts)
         surrogate_loss = (coeff * side_logp).sum()
         if side == "chosen":
-            surrogate_loss = surrogate_loss + self._ar_dpo_chosen_ce_weight * side_out["ce_loss"]
+            chosen_ce_loss = side_out["ce_loss"]
+            ce_token_denom = batch.get("_dpo_chosen_ce_token_denom")
+            if ce_token_denom is not None:
+                ce_token_denom = torch.as_tensor(
+                    ce_token_denom,
+                    device=device,
+                    dtype=chosen_ce_loss.dtype,
+                ).clamp_min(1.0)
+                chunk_token_sum = side_out["token_counts"].to(dtype=chosen_ce_loss.dtype).sum()
+                chosen_ce_loss = chosen_ce_loss * (chunk_token_sum / ce_token_denom)
+            surrogate_loss = surrogate_loss + self._ar_dpo_chosen_ce_weight * chosen_ce_loss
 
         return surrogate_loss, {
             "rl/dpo_surrogate_loss": surrogate_loss.detach(),
