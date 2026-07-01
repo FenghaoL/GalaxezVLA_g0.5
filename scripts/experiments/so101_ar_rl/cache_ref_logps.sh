@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Build/reuse the AR-DPO reference logprob cache, then exit without training.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+SCRIPT_DIR="$ROOT/scripts/experiments/so101_ar_rl"
+RUN_NAME="${RUN_NAME:-cache_ref_logps_$(date +%Y%m%d_%H%M%S)}"
+BASE_CKPT="$ROOT/scripts/so101_square_finetune/runs/so100/so101_square_4ep_20260623_205729/checkpoints/step_9740.pt"
+DATA_YAML="$SCRIPT_DIR/configs/so101_ar_rl_data.yaml"
+PAIRS_PATH="$SCRIPT_DIR/cache/pairs.jsonl"
+ANCHOR_COUNT="${ANCHOR_COUNT:-1}"
+REF_LOGPS_PATH="$SCRIPT_DIR/cache/ref_logps_step9740_anchors${ANCHOR_COUNT}.jsonl"
+
+cd "$ROOT"
+source "$ROOT/.venv/bin/activate"
+
+export PYTHONPATH="$ROOT/scripts/so101_square_finetune:$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export G05_OUTPUT_DIR="$SCRIPT_DIR/runs"
+export EXP_NAME="$RUN_NAME"
+export OVERRIDE_DATASET="$DATA_YAML"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export G05_FORCE_VIDEO_BACKEND=pyav
+export HYDRA_FULL_ERROR=1
+export OC_CAUSE=1
+export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+bash "$SCRIPT_DIR/prepare_data.sh"
+bash "$SCRIPT_DIR/build_pairs.sh"
+
+python -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node="${NPROC_PER_NODE:-1}" \
+  scripts/finetune.py \
+  task=so100 \
+  datastatics_path=null \
+  data.use_weight_for_sampling=false \
+  model.pretrained_ckpt="$BASE_CKPT" \
+  model.use_pretrained_norm_stats=true \
+  model.use_8bit_optimizer=true \
+  model.find_unused_parameters=true \
+  model.batch_size=1 \
+  model.num_workers=2 \
+  model.max_epochs=null \
+  model.max_steps=1 \
+  model.learning_rate=5.0e-6 \
+  model.warmup_steps=20 \
+  model.model_arch.discrete_action=true \
+  model.model_arch.continuous_action=false \
+  model.model_arch.return_continuous_action=false \
+  model.model_arch.checkpoint_vision=false \
+  model.model_arch.checkpoint_vlm=false \
+  model.model_arch.checkpoint_action_expert=false \
+  checkpointing_steps=100000 \
+  eval_steps=100000 \
+  logger.project=g05-so101-ar-rl \
+  logger.workspace=null \
+  logger.mode=offline \
+  logger.experiment_name="$RUN_NAME" \
+  +rl.mode=ar_dpo \
+  +rl.labels_root="$ROOT/data/g05_rl_prepared/so101_g05_rl_pick_white_v1" \
+  +rl.pairs_path="$PAIRS_PATH" \
+  +rl.ref_logps_path="$REF_LOGPS_PATH" \
+  +rl.anchor_count="$ANCHOR_COUNT" \
+  +rl.ref_batch_size=1 \
+  +rl.ref_num_workers=0 \
+  +rl.beta=0.1 \
+  +rl.chosen_ce_weight=0.2 \
+  +rl.cache_only=true \
+  '+rl.exclude_episode_uids=[20260701_114422_ep00003]'

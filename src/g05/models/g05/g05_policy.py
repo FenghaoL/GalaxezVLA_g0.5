@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from g05.models.base_policy import BasePolicy
@@ -32,6 +33,7 @@ from g05.utils.common.import_utils import get_obj_from_str
 from g05.utils.logging.log_box import log_box
 from g05.utils.logging.logging_config import get_logger
 from g05.utils.training.accuracy_accumulator import TrainAccuracyAccumulator
+from g05.rl.so101_preference_data import aggregate_anchor_logps
 
 from .io.input_preprocessor import InputPreprocessor
 from .helpers.proprio_helper import build_proprio_batch
@@ -104,6 +106,14 @@ def _model_log(fh, msg_fn):
 def _sync_if_cuda_available() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def _move_tensor_tree_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: _move_tensor_tree_to_device(v, device) for k, v in value.items()}
+    return value
 
 
 class G05Policy(BasePolicy):
@@ -260,6 +270,8 @@ class G05Policy(BasePolicy):
         # --- Debug log ---
         self._model_log_fh = None
         self._fwd_step = 0
+        self._ar_dpo_beta = 0.1
+        self._ar_dpo_chosen_ce_weight = 0.2
 
         # --- Train-time accuracy accumulator (grad-accum aware) ---
         # Each micro-batch pushes three accuracies (overall/action_token/cot).
@@ -484,6 +496,11 @@ class G05Policy(BasePolicy):
     def predict_action(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return self.forward(batch, inference_mode=True)
 
+    def configure_ar_dpo(self, *, beta: float = 0.1, chosen_ce_weight: float = 0.2) -> None:
+        """Configure lightweight AR-DPO loss coefficients."""
+        self._ar_dpo_beta = float(beta)
+        self._ar_dpo_chosen_ce_weight = float(chosen_ce_weight)
+
     @staticmethod
     def _build_vqa_template(num_images: int) -> str:
         """Build the VQA template for infer_vqa."""
@@ -547,9 +564,8 @@ class G05Policy(BasePolicy):
             Training: (loss: scalar, loss_dict: Dict[str, Tensor])
             Inference: batch, updated in place with predicted batch["action"]
         """
-        samples = batch["samples"]
-
         if inference_mode:
+            samples = batch["samples"]
             was_training = self.training
             self.model.eval()
             generated = self.forward_inference(
@@ -562,6 +578,11 @@ class G05Policy(BasePolicy):
             self.model.train(was_training)
             return batch
         else:
+            if "_dpo_surrogate_side" in batch:
+                return self.forward_ar_dpo_surrogate(batch)
+            if "chosen" in batch and "rejected" in batch:
+                return self.forward_ar_dpo(batch)
+            samples = batch["samples"]
             return self.forward_train(
                 samples=samples,
                 pixel_values=batch["pixel_values"],
@@ -573,6 +594,131 @@ class G05Policy(BasePolicy):
     # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
+
+    def compute_ar_action_logps(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Compute differentiable action-token logprobs for an already collated batch."""
+        samples = batch["samples"]
+        device = next(self.parameters()).device
+        pixel_values = _move_tensor_tree_to_device(batch["pixel_values"], device)
+        if isinstance(pixel_values, Dict):
+            first_image = next(iter(pixel_values.values()))
+            dtype = first_image.dtype
+        else:
+            dtype = pixel_values.dtype
+
+        input_ids, labels, attention_mask, _split_index = self.processor.encode_train(
+            samples,
+            device=device,
+            training=self.training,
+            max_chunk_token_length=self.max_chunk_token_length,
+            max_pad_token_length=self.max_pad_token_length,
+        )
+        pixel_values_processed = self.process_pixel_values(pixel_values)
+        proprio_batch = (
+            build_proprio_batch(
+                samples,
+                device=device,
+                dtype=torch.float32,
+                zero_values=self.model.proprio_encoder == "zeros",
+            )
+            if self.model.proprio_embedder is not None
+            else None
+        )
+        vlm_hidden, _vlm_kv, _position_ids = self.model.vlm_prefill(
+            input_ids,
+            attention_mask,
+            pixel_values_processed,
+            dtype=dtype,
+            split_index=None,
+            proprio=proprio_batch,
+        )
+        return self.model.ar_helper.cal_action_logps(vlm_hidden, labels, self.model)
+
+    def compute_ar_dpo_terms(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Compute AR-DPO terms and first-order surrogate coefficients."""
+        chosen_batch = batch["chosen"]
+        rejected_batch = batch["rejected"]
+        device = next(self.parameters()).device
+        anchor_counts = batch["anchor_counts"].to(device)
+        ref_chosen = batch["ref_chosen_logp"].to(device=device, dtype=torch.float32)
+        ref_rejected = batch["ref_rejected_logp"].to(device=device, dtype=torch.float32)
+
+        chosen_out = self.compute_ar_action_logps(chosen_batch)
+        rejected_out = self.compute_ar_action_logps(rejected_batch)
+        policy_chosen = aggregate_anchor_logps(chosen_out["logps"], anchor_counts)
+        policy_rejected = aggregate_anchor_logps(rejected_out["logps"], anchor_counts)
+
+        pi_margin = policy_chosen - policy_rejected
+        ref_margin = ref_chosen - ref_rejected
+        reward_margin = pi_margin - ref_margin
+        dpo_logits = self._ar_dpo_beta * reward_margin
+        dpo_loss = -F.logsigmoid(dpo_logits).mean()
+        chosen_ce_loss = chosen_out["ce_loss"]
+        total_loss = dpo_loss + self._ar_dpo_chosen_ce_weight * chosen_ce_loss
+        reward_accuracy = (reward_margin.detach() > 0).float().mean()
+        denom = max(1, int(reward_margin.numel()))
+        chosen_coeff = self._ar_dpo_beta * (torch.sigmoid(dpo_logits.detach()) - 1.0) / denom
+        rejected_coeff = -chosen_coeff
+
+        return {
+            "total_loss": total_loss,
+            "dpo_loss": dpo_loss,
+            "chosen_ce_loss": chosen_ce_loss,
+            "policy_chosen": policy_chosen,
+            "policy_rejected": policy_rejected,
+            "ref_chosen": ref_chosen,
+            "ref_rejected": ref_rejected,
+            "reward_margin": reward_margin,
+            "reward_accuracy": reward_accuracy,
+            "chosen_coeff": chosen_coeff.detach(),
+            "rejected_coeff": rejected_coeff.detach(),
+        }
+
+    def _ar_dpo_loss_dict(self, terms: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {
+            "rl/dpo_loss": terms["dpo_loss"],
+            "rl/chosen_ce_loss": terms["chosen_ce_loss"],
+            "rl/total_loss": terms["total_loss"].detach(),
+            "rl/policy_chosen_logp": terms["policy_chosen"].detach().mean(),
+            "rl/policy_rejected_logp": terms["policy_rejected"].detach().mean(),
+            "rl/ref_chosen_logp": terms["ref_chosen"].detach().mean(),
+            "rl/ref_rejected_logp": terms["ref_rejected"].detach().mean(),
+            "rl/reward_margin": terms["reward_margin"].detach().mean(),
+            "rl/reward_accuracy": terms["reward_accuracy"],
+        }
+
+    def forward_ar_dpo(self, batch: Dict[str, Any]):
+        """AR-only DPO over fixed chosen/rejected trajectory anchors."""
+        terms = self.compute_ar_dpo_terms(batch)
+        return terms["total_loss"], self._ar_dpo_loss_dict(terms)
+
+    def forward_ar_dpo_surrogate(self, batch: Dict[str, Any]):
+        """Memory-light first-order DPO surrogate for one side of a pair batch.
+
+        The trainer first computes the DPO margin without gradients, then calls
+        this method separately for the chosen and rejected sides.  Detached
+        first-order coefficients give the same gradient as the pairwise DPO loss
+        at the current parameters while keeping only one VLM graph in memory.
+        """
+        side = str(batch["_dpo_surrogate_side"])
+        if side not in {"chosen", "rejected"}:
+            raise ValueError(f"Unknown DPO surrogate side: {side}")
+
+        device = next(self.parameters()).device
+        anchor_counts = batch["anchor_counts"].to(device)
+        coeff_key = "_dpo_chosen_coeff" if side == "chosen" else "_dpo_rejected_coeff"
+        coeff = batch[coeff_key].to(device=device, dtype=torch.float32).detach()
+
+        side_out = self.compute_ar_action_logps(batch[side])
+        side_logp = aggregate_anchor_logps(side_out["logps"], anchor_counts)
+        surrogate_loss = (coeff * side_logp).sum()
+        if side == "chosen":
+            surrogate_loss = surrogate_loss + self._ar_dpo_chosen_ce_weight * side_out["ce_loss"]
+
+        return surrogate_loss, {
+            "rl/dpo_surrogate_loss": surrogate_loss.detach(),
+            f"rl/{side}_surrogate_logp": side_logp.detach().mean(),
+        }
 
     def forward_train(
         self,
@@ -597,17 +743,23 @@ class G05Policy(BasePolicy):
         """
         fh = self._model_log_fh
         step = self._fwd_step
+        device = next(self.parameters()).device
+        pixel_values = _move_tensor_tree_to_device(pixel_values, device)
         if isinstance(pixel_values, Dict):
             first_image = next(iter(pixel_values.values()))
-            device, dtype = first_image.device, first_image.dtype
+            dtype = first_image.dtype
         else:
-            device, dtype = pixel_values.device, pixel_values.dtype
+            dtype = pixel_values.dtype
         batch_size = len(samples)
 
         # IO checks: actions must be [B, H, D].
         assert actions is not None, "actions required for training"
         assert actions.ndim == 3, f"actions should be [B, H, D], got {actions.shape}"
         assert action_pad_masks is not None, "action_pad_masks is required for training"
+        actions = actions.to(device, non_blocking=True)
+        action_pad_masks = action_pad_masks.to(device, non_blocking=True)
+        if action_dim_is_pad is not None:
+            action_dim_is_pad = action_dim_is_pad.to(device, non_blocking=True)
         assert action_pad_masks.shape == actions.shape[:2], (
             f"action_pad_masks shape mismatch: {action_pad_masks.shape} vs actions {actions.shape[:2]}"
         )

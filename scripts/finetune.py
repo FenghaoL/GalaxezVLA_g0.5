@@ -59,6 +59,14 @@ from g05.utils.data.data_utils import to_json_serializable
 from g05.utils.logging.banner import print_banner
 from g05.utils.logging.log_box import log_box
 from g05.utils.config.config_resolvers import register_default_resolvers
+from g05.rl.so101_preference_data import (
+    BAD_EPISODE_UID,
+    PreferencePairDataset,
+    SuccessFrameDataset,
+    cache_reference_logps,
+    collate_preference_pairs,
+    sha256_file,
+)
 from g05.utils.checkpoint.ckpt_utils import copy_hf_processor_files
 from g05.utils.checkpoint.checkpoint_utils import (
     fix_optimizer_state_after_resume,
@@ -393,6 +401,70 @@ def _build_data_pipeline_summary(
     return rows
 
 
+def _get_rl_mode(cfg: DictConfig) -> Optional[str]:
+    rl_cfg = cfg.get("rl", None)
+    if rl_cfg is None:
+        return None
+    mode = rl_cfg.get("mode", None)
+    if mode in (None, "null", "none", ""):
+        return None
+    return str(mode)
+
+
+def _get_exclude_episode_uids(cfg: DictConfig) -> list[str]:
+    rl_cfg = cfg.get("rl", None)
+    if rl_cfg is None:
+        return [BAD_EPISODE_UID]
+    values = rl_cfg.get("exclude_episode_uids", None)
+    if values is None:
+        return [BAD_EPISODE_UID]
+    return [str(item) for item in values]
+
+
+def _wrap_rl_dataset_if_needed(cfg: DictConfig, train_dataset):
+    mode = _get_rl_mode(cfg)
+    if mode is None:
+        return train_dataset
+
+    labels_root = cfg.rl.get("labels_root", None)
+    if labels_root is None:
+        raise ValueError("rl.labels_root is required for SO101 AR RL modes")
+    exclude_episode_uids = _get_exclude_episode_uids(cfg)
+
+    if mode == "ar_sft_success":
+        return SuccessFrameDataset(
+            train_dataset,
+            labels_root=labels_root,
+            exclude_episode_uids=exclude_episode_uids,
+        )
+    if mode == "ar_dpo":
+        pairs_path = cfg.rl.get("pairs_path", None)
+        if pairs_path is None:
+            raise ValueError("rl.pairs_path is required for rl.mode=ar_dpo")
+        return PreferencePairDataset(
+            train_dataset,
+            pairs_path=pairs_path,
+            labels_root=labels_root,
+            anchor_count=int(cfg.rl.get("anchor_count", 4)),
+            exclude_episode_uids=exclude_episode_uids,
+            ref_logps_path=cfg.rl.get("ref_logps_path", None),
+        )
+    raise ValueError(f"Unsupported rl.mode: {mode}")
+
+
+def _build_ref_cache_metadata(cfg: DictConfig, train_dataset: PreferencePairDataset) -> dict:
+    ckpt = str(cfg.resume_ckpt if cfg.resume_ckpt else cfg.model.pretrained_ckpt)
+    return {
+        "format": "g05_so101_ar_dpo_ref_logps/v1",
+        "base_checkpoint": ckpt,
+        "pairs_path": str(train_dataset.pairs_path),
+        "pairs_sha256": sha256_file(train_dataset.pairs_path),
+        "anchor_count": int(train_dataset.anchor_count),
+        "labels_root": str(train_dataset.labels_root),
+        "excluded_episode_uids": sorted(train_dataset.exclude_episode_uids),
+    }
+
+
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
 def finetune(cfg: DictConfig):
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
@@ -605,6 +677,11 @@ def finetune(cfg: DictConfig):
     model = model.to(device_id)
     if hasattr(model, "action_tokenizer"):
         model.action_tokenizer.to(device_id)
+    if _get_rl_mode(cfg) == "ar_dpo" and hasattr(model, "configure_ar_dpo"):
+        model.configure_ar_dpo(
+            beta=float(cfg.rl.get("beta", 0.1)),
+            chosen_ce_weight=float(cfg.rl.get("chosen_ce_weight", 0.2)),
+        )
 
     with accelerator.main_process_first():
         logger.info(f"[Process {accelerator.process_index}] Loading dataset...")
@@ -759,6 +836,7 @@ def finetune(cfg: DictConfig):
     eval_processor.set_normalizer_from_stats(dataset_stats)
     train_dataset.set_processor(train_processor)
     eval_dataset.set_processor(eval_processor)
+    train_dataset = _wrap_rl_dataset_if_needed(cfg, train_dataset)
 
     overfit_batch = cfg.get("overfit_batch", None)
     if overfit_batch is not None:
@@ -796,8 +874,14 @@ def finetune(cfg: DictConfig):
         shuffle=False,
     )  # no need to resume eval sampler
 
+    rl_mode = _get_rl_mode(cfg)
     # TODO: use keyword to select collate_fn
-    if cfg.model.get("collate_fn"):
+    if rl_mode == "ar_dpo":
+        action_collate_fn = partial(
+            collate_preference_pairs, padding_input_id=train_processor.pad_token_id
+        )
+        logger.info("Using SO101 AR-DPO preference collate_fn")
+    elif cfg.model.get("collate_fn"):
         action_collate_fn = partial(
             collate_fn_pad_sequences, padding_input_id=train_processor.pad_token_id
         )
@@ -832,6 +916,33 @@ def finetune(cfg: DictConfig):
         collate_fn=action_collate_fn,
         prefetch_factor=dl_prefetch_factor,
     )
+
+    if rl_mode == "ar_dpo":
+        if not isinstance(train_dataset, PreferencePairDataset):
+            raise TypeError("rl.mode=ar_dpo expected PreferencePairDataset")
+        ref_logps_path = cfg.rl.get("ref_logps_path", None)
+        if ref_logps_path is None:
+            raise ValueError("rl.ref_logps_path is required for rl.mode=ar_dpo")
+        ref_logps_path = Path(ref_logps_path)
+        if accelerator.is_main_process:
+            logger.info("[SO101 AR-DPO] ensuring reference logp cache at %s", ref_logps_path)
+            cache_reference_logps(
+                policy=model,
+                dataset=train_dataset,
+                output_path=ref_logps_path,
+                padding_input_id=train_processor.pad_token_id,
+                batch_size=int(cfg.rl.get("ref_batch_size", 1)),
+                num_workers=int(cfg.rl.get("ref_num_workers", 0)),
+                metadata=_build_ref_cache_metadata(cfg, train_dataset),
+            )
+        accelerator.wait_for_everyone()
+        train_dataset.load_ref_logps(ref_logps_path)
+        if not train_dataset.has_complete_ref_logps():
+            raise RuntimeError(f"Reference logp cache is incomplete: {ref_logps_path}")
+        if bool(cfg.rl.get("cache_only", False)):
+            logger.info("[SO101 AR-DPO] cache_only=true; reference cache is ready, exiting.")
+            accelerator.end_training()
+            return
 
     evaluator = PeriodicEvaluator(
         eval_dataloader=eval_dataloader,
@@ -1092,7 +1203,7 @@ def finetune(cfg: DictConfig):
         )
 
     # ── Token decode diagnostic (verify AR input/target text) ───────────
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and rl_mode != "ar_dpo":
         from g05.utils.training.train_utils import log_sample_text_diagnostic
 
         log_sample_text_diagnostic(
@@ -1101,6 +1212,8 @@ def finetune(cfg: DictConfig):
             train_processor=train_processor,
             device=device_id,
         )
+    elif accelerator.is_main_process:
+        logger.info("[SO101 AR-DPO] Skipping single-sample text diagnostic for pair batches.")
 
     # ── VLM weight verification (text chat) ─────────────────────────────
     if accelerator.is_main_process:
@@ -1139,6 +1252,7 @@ def finetune(cfg: DictConfig):
             optimizer.zero_grad(set_to_none=True)
             while batch_idx < len(train_dataloader):
                 batch = next(data_iter)
+                diagnostic_batch = batch["chosen"] if rl_mode == "ar_dpo" else batch
 
                 # First batch tokenizer evaluation (only once, controlled by flag).
                 # Restricted to VQ-style tokenizers whose backend.encode returns a dict of
@@ -1156,14 +1270,14 @@ def finetune(cfg: DictConfig):
                             )
                             eval_tokenizer_first_batch(
                                 _inner_model.action_tokenizer,
-                                batch,
+                                diagnostic_batch,
                                 device_id,
                                 hf_tokenizer=_hf_tok,
                             )
 
                 if batch_idx == 0 and step == 0:
                     # Log actual pixel_values tensor shapes from first batch
-                    _pv = batch.get("pixel_values")
+                    _pv = diagnostic_batch.get("pixel_values")
                     if _pv is not None:
                         if isinstance(_pv, dict):
                             _shapes = {k: list(v.shape) for k, v in _pv.items()}
@@ -1171,7 +1285,7 @@ def finetune(cfg: DictConfig):
                             _shapes = list(_pv.shape)
                         logger.info(f"[First Batch] pixel_values shape: {_shapes}")
                     save_train_snapshot(
-                        batch,
+                        diagnostic_batch,
                         output_dir,
                         parts_meta=eval_parts_meta,
                     )
@@ -1184,16 +1298,48 @@ def finetune(cfg: DictConfig):
                 is_optimizer_step = (batch_idx + 1) % cfg.model.grad_accumulation_steps == 0
                 sync_ctx = model.no_sync() if not is_optimizer_step else nullcontext()
                 with sync_ctx:
-                    with accelerator.autocast():
-                        _monitor = get_global_monitor()
-                        if _monitor is not None:
-                            _monitor.reset()
-                            _monitor.set_step(step + 1)
-                        loss, loss_value_dict = model(batch)
-                        last_action_loss = loss.item()
-                    # Normalize loss to account for gradient accumulation
-                    normalized_loss = loss / cfg.model.grad_accumulation_steps
-                    normalized_loss.backward()
+                    if rl_mode == "ar_dpo":
+                        with accelerator.autocast():
+                            _monitor = get_global_monitor()
+                            if _monitor is not None:
+                                _monitor.reset()
+                                _monitor.set_step(step + 1)
+                            with torch.no_grad():
+                                dpo_terms = unwrap_model(model).compute_ar_dpo_terms(batch)
+                            loss_value_dict = unwrap_model(model)._ar_dpo_loss_dict(dpo_terms)
+                            last_action_loss = float(dpo_terms["total_loss"].detach().item())
+
+                            chosen_surrogate_batch = dict(batch)
+                            chosen_surrogate_batch["_dpo_surrogate_side"] = "chosen"
+                            chosen_surrogate_batch["_dpo_chosen_coeff"] = dpo_terms[
+                                "chosen_coeff"
+                            ]
+                            chosen_loss, _ = model(chosen_surrogate_batch)
+                        normalized_loss = chosen_loss / cfg.model.grad_accumulation_steps
+                        normalized_loss.backward()
+                        del chosen_loss, normalized_loss, chosen_surrogate_batch
+
+                        with accelerator.autocast():
+                            rejected_surrogate_batch = dict(batch)
+                            rejected_surrogate_batch["_dpo_surrogate_side"] = "rejected"
+                            rejected_surrogate_batch["_dpo_rejected_coeff"] = dpo_terms[
+                                "rejected_coeff"
+                            ]
+                            rejected_loss, _ = model(rejected_surrogate_batch)
+                        normalized_loss = rejected_loss / cfg.model.grad_accumulation_steps
+                        normalized_loss.backward()
+                        del rejected_loss, normalized_loss, rejected_surrogate_batch, dpo_terms
+                    else:
+                        with accelerator.autocast():
+                            _monitor = get_global_monitor()
+                            if _monitor is not None:
+                                _monitor.reset()
+                                _monitor.set_step(step + 1)
+                            loss, loss_value_dict = model(batch)
+                            last_action_loss = loss.item()
+                        # Normalize loss to account for gradient accumulation
+                        normalized_loss = loss / cfg.model.grad_accumulation_steps
+                        normalized_loss.backward()
 
                 batch_idx += 1
 
@@ -1312,6 +1458,8 @@ def finetune(cfg: DictConfig):
                             ema_model=ema_model if use_ema else None,
                         )
                         logger.info(f"step {step} checkpoint saved")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     # All ranks wait for rank 0 to finish saving before resuming training,
                     # otherwise non-rank-0 may start next forward's all-gather while rank 0
                     # is still doing IO, causing NCCL timeout.

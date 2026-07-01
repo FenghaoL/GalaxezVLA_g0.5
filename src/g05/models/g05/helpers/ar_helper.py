@@ -298,6 +298,65 @@ class ARHelper:
 
         return ce_loss, accuracy.detach()
 
+    @torch.autocast("cuda", enabled=False)
+    def cal_action_logps(
+        self,
+        vlm_hidden: torch.Tensor,
+        labels: torch.LongTensor,
+        model,
+    ) -> Dict[str, torch.Tensor]:
+        """Return differentiable per-sample logprob over action tokens only.
+
+        This is used by trajectory-level DPO.  The prompt/COT/static text tokens are
+        intentionally excluded so the preference objective aligns only the
+        discretized action chunk likelihood.
+        """
+        shift_hidden = vlm_hidden[..., :-1, :].contiguous()
+        shift_labels_2d = labels[..., 1:].contiguous().to(shift_hidden.device)
+        valid_mask_2d = shift_labels_2d != -100
+
+        arange = self.action_token_range
+        if arange is not None:
+            action_mask_2d = (shift_labels_2d >= arange[0]) & (shift_labels_2d <= arange[1])
+            valid_mask_2d = valid_mask_2d & action_mask_2d
+
+        batch_size = int(shift_hidden.shape[0])
+        flat_mask = valid_mask_2d.reshape(-1)
+        num_valid = int(flat_mask.sum().item())
+        logps = torch.zeros(batch_size, device=shift_hidden.device, dtype=torch.float32)
+        token_counts = valid_mask_2d.sum(dim=1).to(device=shift_hidden.device, dtype=torch.float32)
+
+        if num_valid == 0:
+            zero = torch.tensor(
+                0.0,
+                device=shift_hidden.device,
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            return {
+                "logps": logps + zero,
+                "token_counts": token_counts,
+                "ce_loss": zero,
+                "mean_token_logp": logps + zero,
+            }
+
+        shift_hidden_masked = shift_hidden.flatten(0, 1)[flat_mask]
+        shift_labels_masked = shift_labels_2d.reshape(-1)[flat_mask]
+
+        shift_logits = model.vlm.decode(shift_hidden_masked)
+        shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
+        token_nll = F.cross_entropy(shift_logits, shift_labels_masked, reduction="none")
+
+        owners = valid_mask_2d.nonzero(as_tuple=False)[:, 0].to(shift_hidden.device)
+        logps = logps.scatter_add(0, owners, -token_nll.float())
+        denom = token_counts.clamp_min(1.0)
+        return {
+            "logps": logps,
+            "token_counts": token_counts,
+            "ce_loss": token_nll.mean(),
+            "mean_token_logp": logps / denom,
+        }
+
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------

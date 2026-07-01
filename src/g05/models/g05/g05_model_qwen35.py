@@ -466,26 +466,26 @@ class G05ModelQwen35(G05Model):
         else:
             ce_loss, overall_accuracy, action_accuracy, cot_accuracy = None, 0.0, 0.0, 0.0
 
-        # Build prefix-only action cache (KV trimmed to split_index + recurrent states at boundary).
-        vlm_kv_prefix = self._build_prefix_action_kv(vlm_kv, split_index)
+        if continuous_action:
+            # Build prefix-only action cache (KV trimmed to split_index + recurrent states at boundary).
+            vlm_kv_prefix = self._build_prefix_action_kv(vlm_kv, split_index)
 
-        # 3D position_ids [3, B, S] → slice to prefix
-        pos_prefix = position_ids[..., :split_index]
+            # 3D position_ids [3, B, S] → slice to prefix
+            pos_prefix = position_ids[..., :split_index]
 
-        fm_loss = self.fm_helper.train_step(
-            self,
-            vlm_kv_prefix,
-            attention_mask[:, :split_index],
-            pos_prefix,
-            actions,
-            action_pad_masks,
-            action_dim_is_pad,
-            dtype,
-            embodiment_types=kwargs.get("embodiment_types"),
-        )
-
-        if not continuous_action:
-            fm_loss = fm_loss * 0
+            fm_loss = self.fm_helper.train_step(
+                self,
+                vlm_kv_prefix,
+                attention_mask[:, :split_index],
+                pos_prefix,
+                actions,
+                action_pad_masks,
+                action_dim_is_pad,
+                dtype,
+                embodiment_types=kwargs.get("embodiment_types"),
+            )
+        else:
+            fm_loss = torch.zeros((), device=vlm_hidden.device, dtype=vlm_hidden.dtype)
 
         if skip_ce_loss:
             return {"fm_loss": fm_loss}

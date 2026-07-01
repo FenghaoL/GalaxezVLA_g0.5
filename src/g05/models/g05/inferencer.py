@@ -149,7 +149,7 @@ class PolicyInferencer:
     def _postprocess_single(batch: dict, index: int, sub_processor) -> dict:
         """Slice one sample from a batched model output and postprocess it."""
         item_batch = {
-            "action": batch["action"][index : index + 1],
+            "action": batch["ar_action"][index : index + 1],
             "proprio": batch["proprio"][index : index + 1],
         }
         if "action_dim_is_pad" in batch:
