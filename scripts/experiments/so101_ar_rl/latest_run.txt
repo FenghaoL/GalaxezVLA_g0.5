@@ -1,1 +1,1 @@
-/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/experiments/so101_ar_rl/runs/so100/ar_dpo_window_full_20260701_150440
+/home/fenghao/workspace/GalaxeaVLA/GalaxeaVLA/scripts/experiments/so101_ar_rl/runs/so100/ar_sft_success_full_ce_600step_20260701_185649

@@ -1397,7 +1397,17 @@ def finetune(cfg: DictConfig):
                             if _monitor is not None:
                                 _monitor.reset()
                                 _monitor.set_step(step + 1)
-                            loss, loss_value_dict = model(batch)
+                            if rl_mode == "ar_sft_success" and bool(
+                                cfg.rl.get("action_only", False)
+                            ):
+                                sft_batch = dict(batch)
+                                sft_batch["_sft_action_only"] = True
+                                sft_batch["_sft_logp_micro_batch_size"] = int(
+                                    cfg.rl.get("logp_micro_batch_size", 1) or 1
+                                )
+                                loss, loss_value_dict = model(sft_batch)
+                            else:
+                                loss, loss_value_dict = model(batch)
                             last_action_loss = loss.item()
                         # Normalize loss to account for gradient accumulation
                         normalized_loss = loss / cfg.model.grad_accumulation_steps

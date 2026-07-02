@@ -590,6 +590,8 @@ class G05Policy(BasePolicy):
                 return self.forward_ar_dpo_surrogate(batch)
             if "chosen" in batch and "rejected" in batch:
                 return self.forward_ar_dpo(batch)
+            if "_sft_action_only" in batch:
+                return self.forward_ar_sft_action_only(batch)
             samples = batch["samples"]
             return self.forward_train(
                 samples=samples,
@@ -801,6 +803,24 @@ class G05Policy(BasePolicy):
         """AR-only DPO over fixed chosen/rejected trajectory anchors."""
         terms = self.compute_ar_dpo_terms(batch)
         return terms["total_loss"], self._ar_dpo_loss_dict(terms)
+
+    def forward_ar_sft_action_only(self, batch: Dict[str, Any]):
+        """AR-only SFT over action tokens.
+
+        This mirrors the token subset used by AR-DPO: prompt/static text tokens
+        are excluded, and the loss is only the negative log-likelihood of the
+        discretized action tokens.
+        """
+        micro_batch_size = int(batch.get("_sft_logp_micro_batch_size", 0) or 0)
+        out = self.compute_ar_action_logps_microbatched(
+            batch,
+            micro_batch_size=micro_batch_size,
+        )
+        loss = out["ce_loss"]
+        return loss, {
+            "ce_loss": loss.detach(),
+            "train/action_token_logp": out["mean_token_logp"].detach().mean(),
+        }
 
     def forward_ar_dpo_surrogate(self, batch: Dict[str, Any]):
         """Memory-light first-order DPO surrogate for one side of a pair batch.

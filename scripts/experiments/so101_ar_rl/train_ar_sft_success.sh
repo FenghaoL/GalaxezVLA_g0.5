@@ -29,6 +29,10 @@ MAX_STEPS="${MAX_STEPS:-600}"
 CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-200}"
 EVAL_STEPS="${EVAL_STEPS:-100000}"
 LOGGER_MODE="${LOGGER_MODE:-online}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+GRAD_ACCUMULATION_STEPS="${GRAD_ACCUMULATION_STEPS:-1}"
+LOGP_MICRO_BATCH_SIZE="${LOGP_MICRO_BATCH_SIZE:-1}"
+SFT_ACTION_ONLY="${SFT_ACTION_ONLY:-false}"
 
 bash "$SCRIPT_DIR/prepare_data.sh"
 
@@ -46,7 +50,8 @@ python -m torch.distributed.run \
   model.use_pretrained_norm_stats=true \
   model.use_8bit_optimizer=true \
   model.find_unused_parameters=true \
-  model.batch_size=2 \
+  model.batch_size="$BATCH_SIZE" \
+  model.grad_accumulation_steps="$GRAD_ACCUMULATION_STEPS" \
   model.num_workers=2 \
   model.max_epochs=null \
   model.max_steps="$MAX_STEPS" \
@@ -66,5 +71,6 @@ python -m torch.distributed.run \
   logger.experiment_name="$RUN_NAME" \
   +rl.mode=ar_sft_success \
   +rl.labels_root="$ROOT/data/g05_rl_prepared/so101_g05_rl_pick_white_v1" \
+  +rl.action_only="$SFT_ACTION_ONLY" \
+  +rl.logp_micro_batch_size="$LOGP_MICRO_BATCH_SIZE" \
   '+rl.exclude_episode_uids=[20260701_114422_ep00003]'
-

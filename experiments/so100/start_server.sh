@@ -14,17 +14,23 @@ if [[ $# -lt 1 ]]; then
 fi
 
 CKPT="$1"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8765}"
+DEVICE="${DEVICE:-cuda}"
 
 export PYTHONPATH="$PROJECT/src:${PYTHONPATH:-}"
 
 echo "Starting SO100 policy server on $(hostname) ..."
 echo "  ckpt = $CKPT"
+echo "  host = $HOST"
+echo "  port = $PORT"
+echo "  device = $DEVICE"
 cd "$PROJECT"
 python "$PROJECT/scripts/serve_policy.py" \
   --ckpt_path "$CKPT" \
-  --host 0.0.0.0 \
-  --port 8765 \
-  --device cuda \
+  --host "$HOST" \
+  --port "$PORT" \
+  --device "$DEVICE" \
   --action_steps 32 \
   eval_embodiment=so100 \
   model.model_weights_to_bf16=true \
